@@ -1,0 +1,28 @@
+services:
+  datagvat-mcp:
+    build: .
+    image: datagvat-mcp:latest
+    container_name: datagvat-mcp
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # drop this when only Traefik should reach the container
+    environment:
+      # Optional: require "Authorization: Bearer <token>" from clients.
+      # MCP_AUTH_TOKEN: change-me
+      # Trust X-Forwarded-* from your proxy (IP/CIDR list), for correct client IPs in logs.
+      # FORWARDED_ALLOW_IPS: "172.16.0.0/12"
+      AUSTRIA_MCP_LOG_LEVEL: INFO
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # Traefik example (adjust router name, host, entrypoint, certresolver, network):
+    # labels:
+    #   - traefik.enable=true
+    #   - traefik.http.routers.datagvat-mcp.rule=Host(`datagvat-mcp.example.com`)
+    #   - traefik.http.routers.datagvat-mcp.entrypoints=websecure
+    #   - traefik.http.routers.datagvat-mcp.tls.certresolver=letsencrypt
+    #   - traefik.http.services.datagvat-mcp.loadbalancer.server.port=8000
