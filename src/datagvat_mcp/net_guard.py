@@ -1,12 +1,11 @@
-"""Outbound request guard for the preview tools (SSRF protection).
+"""Outbound request guard for preview downloads (SSRF protection).
 
-The upstream preview tools fetch any URL an agent supplies. When the server is
-exposed over HTTP, that lets any connected client make the container request
-internal addresses (other containers, the LAN, cloud metadata endpoints) and
-read the response back. This transport only lets requests through to
-publicly routable IP addresses, checks every redirect hop, and pins the
-connection to the address it validated, so a DNS rebind between check and
-connect cannot redirect it.
+The preview tools fetch URLs supplied by MCP clients. Without a guard any
+connected agent could make the server request internal addresses (other
+containers, the LAN, cloud metadata endpoints) and read the response back.
+This transport only lets requests through to publicly routable IP addresses,
+checks every redirect hop, and pins the connection to the validated address
+so a DNS rebind between check and connect cannot redirect it.
 """
 
 import asyncio

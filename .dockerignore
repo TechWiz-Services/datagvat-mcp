@@ -1,4 +1,7 @@
 *
+!pyproject.toml
+!requirements.txt
+!requirements-dev.txt
 !src/
-!patches/
-!scripts/
+!tests/
+**/__pycache__

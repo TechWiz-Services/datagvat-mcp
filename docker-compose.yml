@@ -5,13 +5,16 @@ services:
     container_name: datagvat-mcp
     restart: unless-stopped
     ports:
-      - "8000:8000"   # drop this when only Traefik should reach the container
+      - "8000:8000"   # remove when only Traefik should reach the container
     environment:
-      # Optional: require "Authorization: Bearer <token>" from clients.
-      # MCP_AUTH_TOKEN: change-me
-      # Trust X-Forwarded-* from your proxy (IP/CIDR list), for correct client IPs in logs.
+      # Clients must send "Authorization: Bearer <token>". Strongly recommended.
+      DATAGVAT_AUTH_TOKEN: ${DATAGVAT_AUTH_TOKEN:-}
+      # Optional: an e-mail/URL added to the User-Agent so data.gv.at can contact you.
+      DATAGVAT_CONTACT: ${DATAGVAT_CONTACT:-}
+      # Optional: only accept these Host headers (DNS-rebinding protection), comma-separated.
+      # DATAGVAT_ALLOWED_HOSTS: datagvat-mcp.example.com
+      # Trust X-Forwarded-* from your proxy network (for correct client IPs in logs).
       # FORWARDED_ALLOW_IPS: "172.16.0.0/12"
-      AUSTRIA_MCP_LOG_LEVEL: INFO
     read_only: true
     tmpfs:
       - /tmp
@@ -19,7 +22,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Traefik example (adjust router name, host, entrypoint, certresolver, network):
+    mem_limit: 256m
+    pids_limit: 64
+    # Traefik example (adjust router name, host, entrypoint, certresolver and network):
     # labels:
     #   - traefik.enable=true
     #   - traefik.http.routers.datagvat-mcp.rule=Host(`datagvat-mcp.example.com`)
