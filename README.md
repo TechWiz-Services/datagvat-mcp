@@ -236,7 +236,9 @@ tests/           pytest suite (offline; test_live.py opt-in)
 
 ## License
 
-[MIT](LICENSE).
+The code is under the [MIT license](LICENSE).
+
+**The data is not.** This server only gives access to data published by third parties. The MIT license covers this software, not what it fetches. Each dataset has its own license, shown in the `licenses` field of `get_dataset` and in every distribution. Most Austrian open data is [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.de), which requires naming the rights holder, but some datasets use other licenses or terms (for example CC BY-SA, CC0 or the older CC BY 3.0 AT). Metadata from data.gv.at and the files on the publishers' servers can differ in this. If you use or republish data you obtained through this server, check and follow the license of that dataset. The server's instructions ask agents to name publisher and license when they pass data on, but that is no substitute for checking.
 
 ## Origin
 
