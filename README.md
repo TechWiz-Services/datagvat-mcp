@@ -11,47 +11,49 @@ This is an unofficial project. It is not affiliated with or endorsed by data.gv.
 
 ## Run
 
-### With the published image
+Images for `linux/amd64` and `linux/arm64` are published to the GitHub Container Registry as `ghcr.io/techwiz-services/datagvat-mcp`. Tags: `latest`, the exact version (`2.0.0`) and the minor version (`2.0`). For a pinned setup use a version tag instead of `latest`, or the image digest.
 
-Images for `linux/amd64` and `linux/arm64` are published to the GitHub Container Registry. Tags: `latest`, the exact version (`2.0.0`) and the minor version (`2.0`).
+Example `docker-compose.yml`. Only the two settings you should set yourself are listed; everything else keeps its default (see [Configuration](#configuration)):
 
-```sh
-docker run -d --name datagvat-mcp -p 8000:8000 --read-only --tmpfs /tmp -v datagvat-cache:/cache \
-  --cap-drop ALL --security-opt no-new-privileges:true \
-  -e DATAGVAT_AUTH_TOKEN=change-me -e DATAGVAT_CONTACT=you@example.org \
-  ghcr.io/techwiz-services/datagvat-mcp:latest
-curl http://localhost:8000/health   # -> ok
+```yaml
+services:
+  datagvat-mcp:
+    image: ghcr.io/techwiz-services/datagvat-mcp:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # remove when only a reverse proxy should reach the container
+    environment:
+      # Clients must send "Authorization: Bearer <token>"
+      DATAGVAT_AUTH_TOKEN: ${DATAGVAT_AUTH_TOKEN:?set a token in .env}
+      # Sent to data.gv.at in the User-Agent so they can reach you
+      DATAGVAT_CONTACT: ${DATAGVAT_CONTACT:-}
+    volumes:
+      - datagvat-cache:/cache   # keeps saved answers across updates
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+
+volumes:
+  datagvat-cache:
 ```
 
-For a pinned setup use a version tag instead of `latest`, or the image digest.
-
-### Build it yourself
+Next to it, a `.env` file:
 
 ```sh
-cp .env.example .env    # set DATAGVAT_AUTH_TOKEN (e.g. openssl rand -hex 32) and DATAGVAT_CONTACT
-docker compose up -d --build
-curl http://localhost:8000/health   # -> ok
+DATAGVAT_AUTH_TOKEN=      # generate one with: openssl rand -hex 32
+DATAGVAT_CONTACT=         # your e-mail address or a URL
 ```
 
-Or without compose:
-
-```sh
-docker build -t datagvat-mcp .
-docker run -d --name datagvat-mcp -p 8000:8000 --read-only --tmpfs /tmp -v datagvat-cache:/cache \
-  --cap-drop ALL --security-opt no-new-privileges:true \
-  -e DATAGVAT_AUTH_TOKEN=change-me datagvat-mcp
-```
+Then `docker compose up -d` and check `curl http://localhost:8000/health` (answers `ok`).
 
 ## Connect agents
 
-Claude Code:
-
-```sh
-claude mcp add --transport http datagvat https://datagvat-mcp.example.com/mcp \
-  --header "Authorization: Bearer change-me"
-```
-
-Generic MCP client configuration:
+MCP client configuration:
 
 ```json
 {
@@ -65,7 +67,7 @@ Generic MCP client configuration:
 }
 ```
 
-Behind Traefik, point the service at port 8000 (see the labels in `docker-compose.yml`). Responses are SSE streams, which Traefik passes through without extra configuration. If your clients connect through a load balancer with several replicas, either use sticky sessions or set `DATAGVAT_STATELESS=true`.
+Behind Traefik, add the usual labels and point the service at port 8000. Responses are SSE streams, which Traefik passes through without extra configuration. If your clients connect through a load balancer with several replicas, either use sticky sessions or set `DATAGVAT_STATELESS=true`.
 
 ## Tools
 
@@ -89,7 +91,7 @@ Search tips (this is how the data.gv.at search engine behaves): German terms wor
 
 ## Configuration
 
-All settings are environment variables. With docker compose, set them in `.env`: the compose file passes every one of them through, and `.env.example` lists them all with their defaults.
+All settings are environment variables. With docker compose, add the ones you want to change under `environment:`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -201,20 +203,7 @@ RIS datasets still show up in search results with their metadata and links. If y
 
 ## Development
 
-```sh
-docker build --target test -t datagvat-mcp:test .     # runs the offline test suite
-docker run --rm -e DATAGVAT_LIVE_TESTS=1 -w /build datagvat-mcp:test python -m pytest   # + live API checks
-```
-
-The live tests send a handful of requests (spaced like every other request) to verify the API still looks the way the server expects. They are worth running when data.gv.at changes something.
-
-For a quick loop while editing, mount the working tree into the test image instead of rebuilding:
-
-```sh
-docker run --rm --network none -v "$PWD:/src:ro" -w /src datagvat-mcp:test python -m pytest
-```
-
-To update dependencies, run `scripts/update-requirements.sh`, review the diff, then rebuild (tests run during the build).
+The offline test suite runs inside the Docker build, so a failing test means no image. `tests/test_live.py` is skipped unless `DATAGVAT_LIVE_TESTS=1` is set; it sends a handful of requests (spaced like every other request) to verify that the API still looks the way the server expects. It is worth running when data.gv.at changes something. To update dependencies, run `scripts/update-requirements.sh` and review the diff.
 
 Releases: set the new version in `pyproject.toml` and `src/datagvat_mcp/__init__.py` (a test checks that they match), commit, then push a tag `v<version>`. The workflow in `.github/workflows/publish.yml` builds the image for both architectures, runs the test suite inside the build and publishes it. Every push and pull request also runs the test suite (`.github/workflows/ci.yml`). The GitHub Actions used are pinned to commit hashes, like the Python dependencies.
 
