@@ -1,17 +1,19 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from conftest import DATASET, FakeClock, make_settings
+from datagvat_mcp import client as client_module
 from datagvat_mcp.client import ApiError, DataGvAtClient, NotFoundError, user_agent, validate_id
 from datagvat_mcp.throttle import Throttle
 
 
-def fake_throttle() -> Throttle:
+def fake_throttle(interval: float = 0) -> Throttle:
     clock = FakeClock()
-    return Throttle(100, 100, clock=clock, sleep=clock.sleep)
+    return Throttle(interval, clock=clock, sleep=clock.sleep)
 
 
 def make_client(handler, **settings_overrides) -> DataGvAtClient:
@@ -69,7 +71,7 @@ async def test_responses_are_cached(fake_api):
 
 
 async def test_cache_disabled_with_zero_ttl(fake_api):
-    c = make_client(fake_api, cache_ttl=0, cache_ttl_static=0)
+    c = make_client(fake_api, cache_dataset_ttl=0)
     await c.get_dataset(DATASET["id"])
     await c.get_dataset(DATASET["id"])
     assert len(fake_api.requests) == 2
@@ -101,14 +103,159 @@ async def test_not_found_is_raised_and_not_cached(fake_api):
 
 
 async def test_retry_after_429_then_success(no_retry_sleep):
-    responses = iter([httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200, json={"result": {}})])
+    responses = iter([httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200, json={"result": {"id": "x"}})])
     throttle = fake_throttle()
     c = DataGvAtClient(make_settings(), transport=httpx.MockTransport(lambda r: next(responses)), throttle=throttle)
-    assert await c.get_dataset("x") == {}
+    assert await c.get_dataset("x") == {"id": "x"}
     assert no_retry_sleep == [7.0]
-    assert throttle._blocked_until > 0  # all other requests back off too
+    assert throttle._clock() >= 7  # the retry itself waited in the throttle: every other request backs off too
     assert c.requests_sent == 2
     await c.close()
+
+
+async def test_retry_after_as_http_date(no_retry_sleep, monkeypatch):
+    # "now" is Fri, 15 Jan 2027 08:00:00 GMT
+    monkeypatch.setattr(client_module, "time", SimpleNamespace(time=lambda: 1_800_000_000.0))
+    responses = iter([httpx.Response(503, headers={"Retry-After": "Fri, 15 Jan 2027 08:00:12 GMT"}),
+                      httpx.Response(200, json={"result": {"id": "x"}})])
+    c = make_client(lambda r: next(responses))
+    assert await c.get_dataset("x") == {"id": "x"}
+    assert no_retry_sleep == [12.0]
+    await c.close()
+
+
+@pytest.mark.parametrize("header", ["soon", "", "-5"])
+async def test_unusable_retry_after_falls_back_to_backoff(no_retry_sleep, header):
+    responses = iter([httpx.Response(429, headers={"Retry-After": header}), httpx.Response(200, json={"result": {"id": "x"}})])
+    c = make_client(lambda r: next(responses))
+    assert await c.get_dataset("x") == {"id": "x"}
+    assert no_retry_sleep == ([0.0] if header == "-5" else [2.0])
+    await c.close()
+
+
+@pytest.mark.parametrize("status", [502, 504])
+async def test_gateway_errors_are_retried_without_penalising_everyone(no_retry_sleep, status):
+    responses = iter([httpx.Response(status), httpx.Response(200, json={"result": {"id": "x"}})])
+    throttle = fake_throttle()
+    c = DataGvAtClient(make_settings(), transport=httpx.MockTransport(lambda r: next(responses)), throttle=throttle)
+    assert await c.get_dataset("x") == {"id": "x"}
+    assert no_retry_sleep == [2.0] and throttle._next_allowed == 0
+    await c.close()
+
+
+async def test_timeouts_are_retried_then_reported(no_retry_sleep):
+    def slow(request):
+        raise httpx.ReadTimeout("slow", request=request)
+
+    c = make_client(slow)
+    with pytest.raises(ApiError, match="did not respond in time"):
+        await c.get_dataset("x")
+    assert c.requests_sent == 3 and no_retry_sleep == [2, 4]
+    await c.close()
+
+
+async def test_failures_are_not_cached(no_retry_sleep):
+    responses = iter([httpx.Response(500, text="boom"), httpx.Response(200, json={"result": {"id": "x"}})])
+    c = make_client(lambda r: next(responses))
+    with pytest.raises(ApiError):
+        await c.get_dataset("x")
+    assert await c.get_dataset("x") == {"id": "x"}
+    await c.close()
+
+
+async def test_requests_never_overlap_and_are_spaced():
+    """The politeness guarantee end to end: one connection, a pause after each response."""
+    clock = FakeClock()
+    active = 0
+    starts, ends = [], []
+
+    async def handler(request):
+        nonlocal active
+        active += 1
+        assert active == 1, "two requests to data.gv.at were in flight at the same time"
+        starts.append(clock.t)
+        await clock.sleep(0.5)  # the response takes half a second
+        ends.append(clock.t)
+        active -= 1
+        return httpx.Response(200, json={"result": {"id": str(request.url)}})
+
+    c = DataGvAtClient(make_settings(), transport=httpx.MockTransport(handler),
+                       throttle=Throttle(2, queue_timeout=600, clock=clock, sleep=clock.sleep))
+    await asyncio.gather(*(c.get_dataset(f"ds-{i}") for i in range(6)))
+    assert len(starts) == 6
+    gaps = [round(s - e, 6) for e, s in zip(ends, starts[1:])]
+    assert all(g >= 2 for g in gaps), gaps
+    await c.close()
+
+
+async def test_cancelled_caller_does_not_fail_the_others_or_waste_the_request():
+    calls = 0
+    release = asyncio.Event()
+
+    async def slow(request):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return httpx.Response(200, json={"result": {"id": "x"}})
+
+    c = make_client(slow)
+    first = asyncio.create_task(c.get_dataset("x"))
+    second = asyncio.create_task(c.get_dataset("x"))
+    await asyncio.sleep(0.01)
+    first.cancel()  # e.g. this caller's MCP client disconnected
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    assert await second == {"id": "x"}
+    assert await c.get_dataset("x") == {"id": "x"}  # ...and the answer was cached
+    assert calls == 1
+    await c.close()
+
+
+async def test_request_finishes_and_is_cached_even_if_every_caller_is_cancelled():
+    release = asyncio.Event()
+    calls = 0
+
+    async def slow(request):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return httpx.Response(200, json={"result": {"id": "x"}})
+
+    c = make_client(slow)
+    only = asyncio.create_task(c.get_dataset("x"))
+    await asyncio.sleep(0.01)
+    only.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await only
+    release.set()
+    assert await c.get_dataset("x") == {"id": "x"}
+    assert calls == 1 and not c._inflight
+    await c.close()
+
+
+async def test_coalesced_callers_all_see_the_same_error():
+    async def broken(request):
+        await asyncio.sleep(0.01)
+        return httpx.Response(500, text="boom")
+
+    c = make_client(broken)
+    results = await asyncio.gather(*(c.get_dataset("x") for _ in range(3)), return_exceptions=True)
+    assert all(isinstance(r, ApiError) for r in results) and c.requests_sent == 1
+    assert not c._inflight
+    await c.close()
+
+
+async def test_close_cancels_requests_in_flight():
+    async def never(request):
+        await asyncio.Event().wait()
+
+    c = make_client(never)
+    pending = asyncio.create_task(c.get_dataset("x"))
+    await asyncio.sleep(0.01)
+    await c.close()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
 
 
 async def test_gives_up_after_repeated_503(no_retry_sleep):
@@ -153,15 +300,44 @@ async def test_non_json_response():
     await c.close()
 
 
+@pytest.mark.parametrize("body", [None, [], "text", 7, {}, {"result": None}, {"result": []}, {"result": "x"},
+                                  {"result": {}}])
+async def test_answers_of_unexpected_shape(body):
+    c = make_client(lambda r: httpx.Response(200, content=json.dumps(body).encode()))
+    assert await c.search(query="x") == {}
+    assert await c.vocabulary_terms("data-theme") == {}
+    assert await c.list_vocabularies() == []
+    for lookup in (c.get_dataset, c.get_catalogue):
+        with pytest.raises(NotFoundError):  # "200 OK" without a document
+            await lookup("x")
+    await c.close()
+
+
+async def test_vocabulary_list_keeps_only_names():
+    c = make_client(lambda r: httpx.Response(200, json=["eurovoc", None, 5, {"id": "x"}, "licence"]))
+    assert await c.list_vocabularies() == ["eurovoc", "licence"]
+    await c.close()
+
+
 async def test_queue_full_is_reported():
     async def slow(request):
         await asyncio.sleep(0.2)
-        return httpx.Response(200, json={"result": {}})
+        return httpx.Response(200, json={"result": {"id": "x"}})
 
     c = DataGvAtClient(make_settings(), transport=httpx.MockTransport(slow),
-                       throttle=Throttle(100, 100, concurrency=1, queue_timeout=0.05))
+                       throttle=Throttle(0, queue_timeout=0.05))
     results = await asyncio.gather(c.get_dataset("a"), c.get_dataset("b"), return_exceptions=True)
     assert any(isinstance(r, ApiError) and "queue" in str(r) for r in results)
+    await c.close()
+
+
+async def test_each_upstream_request_is_logged_at_debug_level(fake_api, caplog):
+    c = make_client(fake_api)
+    with caplog.at_level("DEBUG", logger="datagvat_mcp.client"):
+        await c.get_dataset(DATASET["id"])
+        await c.get_dataset(DATASET["id"])  # cached: no request, no line
+    lines = [r.getMessage() for r in caplog.records if r.name == "datagvat_mcp.client"]
+    assert len(lines) == 1 and lines[0].startswith(f"GET datasets/{DATASET['id']} -> 200 in ")
     await c.close()
 
 

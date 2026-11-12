@@ -4,4 +4,9 @@
 !requirements-dev.txt
 !src/
 !tests/
+# only for the test stage (tests/test_docs.py); not copied into the runtime image
+!README.md
+!.env.example
+!docker-compose.yml
+!Dockerfile
 **/__pycache__

@@ -4,6 +4,7 @@ import functools
 import logging
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -12,11 +13,15 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from datagvat_mcp import __version__
+from datagvat_mcp.cache import end_call, start_call
 from datagvat_mcp.client import MAX_RESULT_WINDOW, ApiError, DataGvAtClient, NotFoundError, validate_id
 from datagvat_mcp.config import Settings, get_settings
 from datagvat_mcp.normalize import (
     THEMES,
+    as_int,
+    as_str,
     detail_dataset,
+    dict_items,
     first_url,
     format_label,
     normalize_distribution,
@@ -45,7 +50,9 @@ Typical workflow: search_datasets (or semantic_search_datasets for plain-languag
 details and download links -> preview_schema / preview_data to look inside CSV/JSON files.
 Use list_catalogues to find publisher catalogue ids (e.g. 'l9' = Stadt Wien) for filtering.
 Search terms work best in German. Multiple words are OR-combined and ranked by relevance; use AND to require all.
-Requests to data.gv.at are rate-limited and cached by this server, so prefer fewer, more specific calls."""
+To be polite to data.gv.at this server sends one request at a time with a pause in between and caches answers,
+so prefer fewer, more specific calls; do not page through large result sets.
+When you pass data on, name the publisher and the license (most datasets are CC BY 4.0, which requires attribution)."""
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True)
 
@@ -64,16 +71,25 @@ _configured_settings: Settings | None = None
 
 
 def make_services(settings: Settings) -> Services:
+    client = DataGvAtClient(settings)
+    throttles = HostThrottles(settings.preview_request_interval, settings.queue_timeout)
+    # Files hosted on data.gv.at itself count against the API's limit, not a separate one.
+    api_host = urlparse(settings.api_base).hostname
+    if api_host:
+        bare = api_host.removeprefix("www.")
+        for host in (bare, "www." + bare):
+            throttles.register(host, client.throttle)
     return Services(
         settings=settings,
-        client=DataGvAtClient(settings),
+        client=client,
         preview=PreviewFetcher(
             max_bytes=settings.preview_max_bytes,
             timeout=settings.request_timeout,
-            throttles=HostThrottles(settings.rate_limit, settings.rate_burst, settings.queue_timeout),
-            cache_entries=settings.preview_cache_entries,
-            cache_ttl=settings.cache_ttl,
+            throttles=throttles,
+            cache=client.cache,
+            cache_ttl=settings.cache_preview_ttl,
             contact=settings.contact,
+            blocked_hosts=settings.preview_blocked_host_list,
         ),
     )
 
@@ -102,16 +118,27 @@ def tool_errors(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
+        call = start_call()
         try:
-            return await fn(*args, **kwargs)
+            result = await fn(*args, **kwargs)
         except ToolError:
+            end_call(call)
             raise
-        except NotFoundError as e:
-            raise ToolError(str(e)) from e
         except (ApiError, PreviewError, ValueError) as e:
+            end_call(call)
             raise ToolError(str(e)) from e
+        # Tell the agent when (part of) the answer is a saved copy, and how old it is.
+        from_cache = end_call(call)
+        return {**result, "cache": from_cache} if from_cache and isinstance(result, dict) else result
 
     return wrapper
+
+
+Refresh = Annotated[
+    bool,
+    Field(description="Fetch a new copy instead of the saved one. Only use it when the user says the answer is "
+                      "outdated; copies younger than 5 minutes are returned as they are."),
+]
 
 
 def _check_themes(themes: list[str] | None) -> list[str]:
@@ -120,6 +147,11 @@ def _check_themes(themes: list[str] | None) -> list[str]:
     if bad:
         raise ToolError(f"Unknown theme code(s) {bad}. Valid: {', '.join(THEMES)}")
     return out
+
+
+def _count(result: dict[str, Any]) -> int:
+    """Total number of hits of a search answer."""
+    return max(0, as_int(result.get("count")) or 0)
 
 
 def _sort_param(sort_by: str, lang: str) -> str | None:
@@ -144,6 +176,7 @@ async def _search(
     limit: int = 10,
     page: int = 0,
     include_facets: bool = False,
+    refresh: bool = False,
 ) -> dict[str, Any]:
     lang = svc.settings.language
     facets: dict[str, list[str]] = {}
@@ -167,14 +200,15 @@ async def _search(
         max_date=f"{max_date}T23:59:59Z" if max_date else None,
         includes=SUMMARY_FIELDS,
         aggregation_fields=["catalog", "categories", "format", "license"] if include_facets else None,
+        refresh=refresh,
     )
-    count = int(result.get("count") or 0)
+    count = _count(result)
     out: dict[str, Any] = {
         "count": count,
         "page": page,
         "limit": limit,
         "has_more": (page + 1) * limit < min(count, MAX_RESULT_WINDOW),
-        "results": [summarize_dataset(d, lang) for d in result.get("results") or [] if isinstance(d, dict)],
+        "results": [summarize_dataset(d, lang) for d in dict_items(result.get("results"))],
     }
     if include_facets:
         out["facets"] = normalize_facets(result.get("facets"), lang)
@@ -195,7 +229,7 @@ async def _preview_candidates(
         d = await svc.client.get_dataset(dataset_id)
     except NotFoundError as e:
         raise ToolError(f"Dataset {dataset_id!r} not found") from e
-    dists = [x for x in d.get("distributions") or [] if isinstance(x, dict)]
+    dists = dict_items(d.get("distributions"))
     if distribution_id:
         dists = [x for x in dists if x.get("id") == distribution_id]
         if not dists:
@@ -212,18 +246,18 @@ async def _preview_candidates(
     return out[:MAX_PREVIEW_CANDIDATES]
 
 
-async def _fetch_preview(svc: Services, url, dataset_id, distribution_id):
+async def _fetch_preview(svc: Services, url, dataset_id, distribution_id, refresh=False):
     """Fetch the first working candidate (catalogue links are sometimes dead)."""
     candidates = await _preview_candidates(svc, url, dataset_id, distribution_id)
-    failures = []
+    failures: list[tuple[str, str]] = []
     for link, dist in candidates:
         try:
-            return link, dist, await svc.preview.fetch(link)
+            return link, dist, await svc.preview.fetch(link, refresh)
         except PreviewError as e:
-            failures.append(f"{link}: {e}")
+            failures.append((link, str(e)))
     if len(failures) == 1:
-        raise PreviewError(failures[0].split(": ", 1)[1])
-    raise PreviewError("All candidate distributions failed: " + "; ".join(failures))
+        raise PreviewError(failures[0][1])
+    raise PreviewError("All candidate distributions failed: " + "; ".join(f"{link}: {msg}" for link, msg in failures))
 
 
 def build_server(settings: Settings | None = None) -> FastMCP:
@@ -248,8 +282,7 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         streamable_http_path=settings.path,
         stateless_http=settings.stateless,
         transport_security=security,
-        log_level=settings.log_level.upper() if settings.log_level.upper() in
-        ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") else "INFO",
+        log_level=settings.log_level,
     )
     mcp._mcp_server.version = __version__
 
@@ -294,12 +327,13 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         include_facets: Annotated[
             bool, Field(description="Also return counts per catalogue, theme, format and license (top 10 each)")
         ] = False,
+        refresh: Refresh = False,
     ) -> dict[str, Any]:
         """Search data.gv.at datasets with full-text query and filters. Returns compact summaries
         (title, description excerpt, publisher, themes, formats, dates, portal URL)."""
         return await _search(
             get_services(), query, _check_themes(themes), formats, catalogue_ids, high_value_only,
-            min_date, max_date, sort_by, limit, page, include_facets,
+            min_date, max_date, sort_by, limit, page, include_facets, refresh,
         )
 
     @mcp.tool(annotations=READ_ONLY)
@@ -339,12 +373,13 @@ def build_server(settings: Settings | None = None) -> FastMCP:
     @tool_errors
     async def get_dataset(
         dataset_id: Annotated[str, Field(description="Dataset id (from search results)")],
+        refresh: Refresh = False,
     ) -> dict[str, Any]:
         """Full metadata of one dataset: description, publisher and contacts, licenses, update frequency,
         temporal coverage, provenance and all distributions (files/APIs) with their URLs."""
         svc = get_services()
         try:
-            d = await svc.client.get_dataset(dataset_id)
+            d = await svc.client.get_dataset(dataset_id, refresh)
         except NotFoundError as e:
             raise ToolError(f"Dataset {dataset_id!r} not found") from e
         return detail_dataset(d, svc.settings.language)
@@ -360,9 +395,8 @@ def build_server(settings: Settings | None = None) -> FastMCP:
             d = await svc.client.get_dataset(dataset_id)
         except NotFoundError as e:
             raise ToolError(f"Dataset {dataset_id!r} not found") from e
-        dists = [normalize_distribution(x, svc.settings.language) for x in d.get("distributions") or []
-                 if isinstance(x, dict)]
-        return {"dataset_id": d.get("id", dataset_id), "title": pick(d.get("title"), svc.settings.language),
+        dists = [normalize_distribution(x, svc.settings.language) for x in dict_items(d.get("distributions"))]
+        return {"dataset_id": as_str(d.get("id")) or dataset_id, "title": pick(d.get("title"), svc.settings.language),
                 "count": len(dists), "distributions": dists}
 
     @mcp.tool(annotations=READ_ONLY)
@@ -377,14 +411,13 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         Use the returned ids as catalogue_ids in search_datasets."""
         svc = get_services()
         lang = svc.settings.language
-        ttl = svc.settings.cache_ttl_static
         if query:
             result = await svc.client.search(kind="catalogue", query=query, limit=limit,
-                                             includes=["id", "title", "description", "count"], ttl=ttl)
-            cats = [summarize_catalogue(c, lang, desc_len=200) for c in result.get("results") or []]
+                                             includes=["id", "title", "description", "count"])
+            cats = [summarize_catalogue(c, lang, desc_len=200) for c in dict_items(result.get("results"))]
             cats.sort(key=lambda c: -(c.get("dataset_count") or 0))  # empty duplicate catalogues last
-            return {"count": result.get("count", 0), "catalogues": cats}
-        result = await svc.client.search(limit=0, aggregation_fields=["catalog"], ttl=ttl)
+            return {"count": _count(result), "catalogues": cats}
+        result = await svc.client.search(limit=0, aggregation_fields=["catalog"], category="catalogue")
         top = normalize_facets(result.get("facets"), lang, top=limit).get("catalog", [])
         return {
             "note": "Top catalogues by number of datasets",
@@ -400,6 +433,7 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         """Details of a publisher catalogue (description, dataset count) plus its most recently updated datasets."""
         svc = get_services()
         lang = svc.settings.language
+        catalogue_id = validate_id(catalogue_id, "catalogue id")
         try:
             cat = summarize_catalogue(await svc.client.get_catalogue(catalogue_id), lang)
         except NotFoundError as e:
@@ -407,7 +441,8 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         if recent_datasets:
             result = await svc.client.search(facets={"catalog": [catalogue_id]}, sort="modified+desc",
                                              limit=recent_datasets, includes=SUMMARY_FIELDS)
-            cat["recent_datasets"] = [summarize_dataset(d, lang, desc_len=160) for d in result.get("results") or []]
+            cat["recent_datasets"] = [summarize_dataset(d, lang, desc_len=160)
+                                      for d in dict_items(result.get("results"))]
         return cat
 
     # ------------------------------------------------------------- analysis
@@ -451,7 +486,8 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         lang = svc.settings.language
         rows, missing = [], []
         theme_sets, kw_sets = [], []
-        for ds_id in dict.fromkeys(dataset_ids):
+        ids = [validate_id(i, "dataset id") for i in dataset_ids]  # all of them, before the first request
+        for ds_id in dict.fromkeys(ids):
             try:
                 d = await svc.client.get_dataset(ds_id)
             except NotFoundError:
@@ -508,8 +544,8 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         """List the terms of a controlled vocabulary (paged; EuroVoc has ~7,000 terms)."""
         svc = get_services()
         result = await svc.client.vocabulary_terms(vocabulary_id, limit=limit, page=page)
-        terms = [vocab_term(t, svc.settings.language) for t in result.get("results") or []]
-        count = int(result.get("count") or 0)
+        terms = [vocab_term(t, svc.settings.language) for t in dict_items(result.get("results"))]
+        count = _count(result)
         if not count and not terms:
             raise ToolError(f"Vocabulary {vocabulary_id!r} not found or empty; see list_vocabularies")
         return {"vocabulary": vocabulary_id, "count": count, "page": page,
@@ -525,8 +561,8 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         """Search for terms within a controlled vocabulary."""
         svc = get_services()
         result = await svc.client.vocabulary_terms(vocabulary_id, query=query, limit=limit)
-        return {"vocabulary": vocabulary_id, "query": query, "count": int(result.get("count") or 0),
-                "terms": [vocab_term(t, svc.settings.language) for t in result.get("results") or []]}
+        return {"vocabulary": vocabulary_id, "query": query, "count": _count(result),
+                "terms": [vocab_term(t, svc.settings.language) for t in dict_items(result.get("results"))]}
 
     # -------------------------------------------------------------- preview
 
@@ -548,11 +584,12 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         dataset_id: preview_target["dataset_id"] = None,
         distribution_id: preview_target["distribution_id"] = None,
         format: preview_target["format"] = None,
+        refresh: Refresh = False,
     ) -> dict[str, Any]:
         """Infer the columns of a CSV or JSON/GeoJSON file (name, type, example values) from its first part
         (at most 512 KB are downloaded)."""
         svc = get_services()
-        link, dist, f = await _fetch_preview(svc, url, dataset_id, distribution_id)
+        link, dist, f = await _fetch_preview(svc, url, dataset_id, distribution_id, refresh)
         parsed = parse(f.content, f.partial, f.final_url, f.content_type, format, max_rows=1)
         parsed.pop("rows", None)
         parsed.pop("more_rows_available", None)
@@ -567,11 +604,12 @@ def build_server(settings: Settings | None = None) -> FastMCP:
         distribution_id: preview_target["distribution_id"] = None,
         format: preview_target["format"] = None,
         max_rows: Annotated[int, Field(ge=1, le=100)] = 20,
+        refresh: Refresh = False,
     ) -> dict[str, Any]:
         """Show the first rows of a CSV or JSON/GeoJSON file (at most 512 KB are downloaded). Handles
         semicolon-separated files, Windows-1252 encoding and decimal commas common in Austrian data."""
         svc = get_services()
-        link, dist, f = await _fetch_preview(svc, url, dataset_id, distribution_id)
+        link, dist, f = await _fetch_preview(svc, url, dataset_id, distribution_id, refresh)
         parsed = parse(f.content, f.partial, f.final_url, f.content_type, format, max_rows=max_rows)
         return {"url": link, "distribution": dist, "content_type": f.content_type,
                 "bytes_read": len(f.content), "partial_download": f.partial, **parsed}

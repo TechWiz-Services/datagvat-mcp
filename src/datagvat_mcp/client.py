@@ -12,12 +12,12 @@ import logging
 import re
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 
 from datagvat_mcp import __version__
-from datagvat_mcp.cache import MISSING, TTLCache
+from datagvat_mcp.cache import DiskCache, Hit, note_served
 from datagvat_mcp.config import Settings
 from datagvat_mcp.throttle import Throttle, ThrottleTimeout
 
@@ -31,6 +31,7 @@ MAX_RESULT_WINDOW = 10_000  # Elasticsearch default: page * limit must stay belo
 RETRY_STATUSES = {429, 502, 503, 504}
 MAX_ATTEMPTS = 3
 MAX_RETRY_WAIT = 30.0
+MIN_REFRESH_AGE = 300.0  # seconds; a "refresh" request for a younger saved copy is answered from the cache
 
 _sleep = asyncio.sleep  # indirection so tests can skip real waiting
 
@@ -64,6 +65,12 @@ def _retry_after(resp: httpx.Response) -> float | None:
             return None
 
 
+def _result(data: Any) -> dict[str, Any]:
+    """The `result` object of an API answer, or {} if the answer has another shape."""
+    result = data.get("result") if isinstance(data, dict) else None
+    return result if isinstance(result, dict) else {}
+
+
 def user_agent(contact: str = "") -> str:
     ua = f"datagvat-mcp/{__version__} (self-hosted MCP server; httpx)"
     return f"{ua} contact: {contact}" if contact else ua
@@ -75,6 +82,7 @@ class DataGvAtClient:
         settings: Settings,
         transport: httpx.AsyncBaseTransport | None = None,
         throttle: Throttle | None = None,
+        cache: DiskCache | None = None,
     ):
         self.settings = settings
         self._http = httpx.AsyncClient(
@@ -84,51 +92,84 @@ class DataGvAtClient:
             follow_redirects=True,
             transport=transport,
         )
-        self._throttle = throttle or Throttle(
-            settings.rate_limit, settings.rate_burst, settings.max_concurrency, settings.queue_timeout
+        self.throttle = throttle or Throttle(settings.request_interval, settings.queue_timeout)
+        self.cache = cache or DiskCache(
+            (settings.cache_dir or None) if settings.cache_enabled else None,  # switched off: no file either
+            settings.cache_limits,
+            settings.cache_max_stale,
         )
-        self._cache = TTLCache(settings.cache_max_entries)
-        self._inflight: dict[tuple, asyncio.Future] = {}
+        self._inflight: dict[str, asyncio.Task] = {}
         self.requests_sent = 0
 
     async def close(self) -> None:
+        for task in list(self._inflight.values()):
+            task.cancel()
         await self._http.aclose()
+        self.cache.close()
 
     # ------------------------------------------------------------------ core
 
-    async def get(self, path: str, params: dict[str, Any] | None = None, ttl: float | None = None) -> Any:
-        """GET a JSON document, served from cache when possible.
+    async def get(
+        self, path: str, params: dict[str, Any] | None = None, category: str = "search", refresh: bool = False
+    ) -> Any:
+        """GET a JSON document, served from the cache when possible.
 
-        Concurrent identical requests share one upstream call.
+        `refresh` asks for a new copy; it is ignored while the saved one is
+        only a few minutes old. If data.gv.at cannot be reached, a saved copy
+        is returned even when it is past its lifetime.
+
+        Concurrent identical requests share one upstream call. That call runs
+        as its own task: a caller that gets cancelled (its MCP client went
+        away) neither fails the other callers waiting for the same document
+        nor wastes a request that is already on its way.
         """
         params = {k: v for k, v in (params or {}).items() if v is not None}
-        key = (path, tuple(sorted((k, str(v)) for k, v in params.items())))
-        cached = self._cache.get(key)
-        if cached is not MISSING:
-            return cached
-        if key in self._inflight:
-            return await asyncio.shield(self._inflight[key])
+        key = path + "?" + urlencode(sorted((k, str(v)) for k, v in params.items()))
+        hit = self.cache.get(category, key)
+        if hit and hit.fresh and not (refresh and self.cache.now() - hit.stored_at >= MIN_REFRESH_AGE):
+            note_served(hit.stored_at, stale=False)
+            return hit.value
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.ensure_future(self._fetch_and_cache(category, key, path, params, hit))
+            self._inflight[key] = task
+            task.add_done_callback(lambda t: self._finished(key, t))
+        data, fallback = await asyncio.shield(task)
+        if fallback:
+            note_served(fallback.stored_at, stale=not fallback.fresh)
+        return data
 
-        fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._inflight[key] = fut
+    def _finished(self, key: str, task: asyncio.Task) -> None:
+        if self._inflight.get(key) is task:
+            del self._inflight[key]
+        if not task.cancelled():
+            task.exception()  # mark retrieved: every caller may have been cancelled
+
+    async def _fetch_and_cache(
+        self, category: str, key: str, path: str, params: dict[str, Any], saved: Hit | None
+    ) -> tuple[Any, Hit | None]:
+        """Returns (data, None) when fetched now, or (saved copy, its Hit) when data.gv.at failed."""
         try:
             data = await self._fetch(path, params)
-        except BaseException as e:
-            fut.set_exception(e)
-            fut.exception()  # mark retrieved; waiters (if any) still get it
+        except NotFoundError:
             raise
-        else:
-            self._cache.set(key, data, self.settings.cache_ttl if ttl is None else ttl)
-            fut.set_result(data)
-            return data
-        finally:
-            self._inflight.pop(key, None)
+        except ApiError as e:
+            if saved is None:
+                raise
+            logger.warning("Serving a saved copy of %s from the cache: %s", path, e)
+            return saved.value, saved
+        # Only keep answers that look right: a broken one must not stick for days.
+        if _result(data) or (path == "vocabularies" and isinstance(data, list) and data):
+            self.cache.set(category, key, data, self.settings.cache_ttl(category))
+        return data, None
 
     async def _fetch(self, path: str, params: dict[str, Any]) -> Any:
+        loop = asyncio.get_running_loop()
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
-                async with self._throttle.slot():
+                async with self.throttle.slot():
                     self.requests_sent += 1
+                    started = loop.time()
                     resp = await self._http.get(path, params=params)
             except ThrottleTimeout as e:
                 raise ApiError(
@@ -147,6 +188,7 @@ class DataGvAtClient:
                 raise ApiError(f"Could not reach data.gv.at: {e.__class__.__name__}") from e
 
             status = resp.status_code
+            logger.debug("GET %s -> %s in %.2f s", path, status, loop.time() - started)
             if status == 404:
                 raise NotFoundError("not found")
             if status in RETRY_STATUSES:
@@ -154,7 +196,7 @@ class DataGvAtClient:
                 if wait is None:
                     wait = 2.0**attempt
                 if status in (429, 503):
-                    self._throttle.penalize(min(wait, MAX_RETRY_WAIT))
+                    self.throttle.penalize(min(wait, MAX_RETRY_WAIT))
                 logger.warning("data.gv.at answered %s for %s; attempt %d", status, path, attempt)
                 if attempt < MAX_ATTEMPTS and wait <= MAX_RETRY_WAIT:
                     await _sleep(wait)
@@ -183,9 +225,14 @@ class DataGvAtClient:
         includes: list[str] | None = None,
         aggregation_fields: list[str] | None = None,
         extra: dict[str, Any] | None = None,
-        ttl: float | None = None,
+        category: str | None = None,
+        refresh: bool = False,
     ) -> dict[str, Any]:
-        """Run /search and return the `result` object ({count, results, facets?})."""
+        """Run /search and return the `result` object ({count, results, facets?}).
+
+        `category` is the cache category; by default it follows `kind`.
+        """
+        category = category or {"catalogue": "catalogue", "vocabulary": "vocabulary"}.get(kind, "search")
         if page * limit >= MAX_RESULT_WINDOW:
             raise ValueError(f"page * limit must be below {MAX_RESULT_WINDOW}")
         params: dict[str, Any] = {"filters": kind, "limit": limit, "page": page}
@@ -208,21 +255,24 @@ class DataGvAtClient:
         else:
             params["aggregation"] = "false"  # facets are huge (all EU languages); skip unless asked
         params.update(extra or {})
-        data = await self.get("search", params, ttl=ttl)
-        return data.get("result", {}) if isinstance(data, dict) else {}
+        return _result(await self.get("search", params, category, refresh))
 
-    async def get_dataset(self, dataset_id: str) -> dict[str, Any]:
+    async def get_dataset(self, dataset_id: str, refresh: bool = False) -> dict[str, Any]:
         dataset_id = validate_id(dataset_id, "dataset id")
-        data = await self.get(f"datasets/{quote(dataset_id, safe='')}", ttl=self.settings.cache_ttl_static)
-        return data.get("result", {}) if isinstance(data, dict) else {}
+        return await self._document(f"datasets/{quote(dataset_id, safe='')}", "dataset", refresh)
 
     async def get_catalogue(self, catalogue_id: str) -> dict[str, Any]:
         catalogue_id = validate_id(catalogue_id, "catalogue id")
-        data = await self.get(f"catalogues/{quote(catalogue_id, safe='')}", ttl=self.settings.cache_ttl_static)
-        return data.get("result", {}) if isinstance(data, dict) else {}
+        return await self._document(f"catalogues/{quote(catalogue_id, safe='')}", "catalogue")
+
+    async def _document(self, path: str, category: str, refresh: bool = False) -> dict[str, Any]:
+        result = _result(await self.get(path, None, category, refresh))
+        if not result:
+            raise NotFoundError("not found")  # 200 with an empty body instead of a 404
+        return result
 
     async def list_vocabularies(self) -> list[str]:
-        data = await self.get("vocabularies", ttl=self.settings.cache_ttl_static)
+        data = await self.get("vocabularies", None, "vocabulary")
         return [v for v in data if isinstance(v, str)] if isinstance(data, list) else []
 
     async def vocabulary_terms(
@@ -235,5 +285,4 @@ class DataGvAtClient:
             limit=limit,
             page=page,
             extra={"vocabulary": vocabulary_id},
-            ttl=self.settings.cache_ttl_static,
         )

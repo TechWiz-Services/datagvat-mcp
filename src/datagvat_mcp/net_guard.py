@@ -19,11 +19,20 @@ class BlockedURLError(httpx.RequestError):
     """Raised when a request targets a non-public destination."""
 
 
+# IPv6 ranges whose last 32 bits are an IPv4 address the packet may end up at:
+# NAT64 (RFC 6052) and the deprecated IPv4-compatible addresses.
+_EMBEDS_IPV4 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::/96"))
+
+
 def is_public_ip(ip: str) -> bool:
     addr = ipaddress.ip_address(ip.split("%", 1)[0])
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
-        addr = addr.ipv4_mapped
-    return addr.is_global and not addr.is_multicast
+    if isinstance(addr, ipaddress.IPv6Address):
+        if addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        elif any(addr in net for net in _EMBEDS_IPV4):
+            addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)  # judge by the embedded address
+    # is_global still passes the deprecated site-local range fec0::/10, which networks may use internally.
+    return addr.is_global and not addr.is_multicast and not getattr(addr, "is_site_local", False)
 
 
 class PublicOnlyTransport(httpx.AsyncHTTPTransport):

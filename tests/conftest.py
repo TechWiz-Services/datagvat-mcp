@@ -118,8 +118,8 @@ class FakeClock:
 
 def make_settings(**overrides) -> Settings:
     base = dict(
-        api_base=API, rate_limit=10, rate_burst=20, max_concurrency=4, queue_timeout=5,
-        cache_ttl=3600, cache_ttl_static=86400, contact="", auth_token=None, allowed_hosts="",
+        api_base=API, request_interval=0, queue_timeout=5,
+        cache_dir="", contact="", auth_token=None, allowed_hosts="",
     )
     base.update(overrides)
     return Settings(**base)
@@ -132,6 +132,8 @@ class FakeApi:
         self.requests: list[httpx.Request] = []
         self.datasets = {d["id"]: copy.deepcopy(d) for d in (DATASET, DATASET_2, DATASET_3)}
         self.empty_when_theme: set[str] = set()
+        self.raw: dict[str, object] = {}  # path -> JSON body returned as is (for malformed answers)
+        self.respond: Callable[[httpx.Request], httpx.Response] | None = None  # answers everything if set
 
     def calls(self, path: str) -> list[httpx.Request]:
         return [r for r in self.requests if r.url.path.endswith(path)]
@@ -140,6 +142,10 @@ class FakeApi:
         self.requests.append(request)
         path = request.url.path.removeprefix("/api/hub/search/")
         p = request.url.params
+        if self.respond:
+            return self.respond(request)
+        if path in self.raw:
+            return httpx.Response(200, json=self.raw[path])
         if path == "search":
             kind = p.get("filters")
             limit = int(p.get("limit", 10))
@@ -210,13 +216,15 @@ async def services(settings, fake_api, preview_files, no_retry_sleep):
         handler = preview_files.get(str(request.url))
         return handler(request) if handler else httpx.Response(404)
 
+    client = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api))
     svc = Services(
         settings=settings,
-        client=DataGvAtClient(settings, transport=httpx.MockTransport(fake_api)),
+        client=client,
         preview=PreviewFetcher(
             max_bytes=settings.preview_max_bytes,
             timeout=5,
-            throttles=HostThrottles(100, 100, 5),
+            throttles=HostThrottles(0, 5),
+            cache=client.cache,  # one cache for both, as in production
             transport_factory=lambda: httpx.MockTransport(preview_handler),
         ),
     )

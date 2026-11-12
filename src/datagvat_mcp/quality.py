@@ -8,7 +8,18 @@ DCAT-AP / MQA dimensions (findability, accessibility, reusability, contextuality
 from datetime import date, datetime
 from typing import Any
 
-from datagvat_mcp.normalize import clean_text, dataset_formats, keyword_labels, pick, theme_codes
+from datagvat_mcp.normalize import (
+    as_dict,
+    as_str,
+    clean_text,
+    dataset_formats,
+    dict_items,
+    first_url,
+    keyword_labels,
+    pick,
+    scalar,
+    theme_codes,
+)
 
 MACHINE_READABLE = {
     "CSV", "JSON", "GEOJSON", "XML", "RDF", "RDF_XML", "TURTLE", "JSON_LD", "XLSX", "XLS", "ODS",
@@ -27,19 +38,19 @@ def _parse_date(value: Any) -> date | None:
 
 
 def _has_frequency(freq: Any) -> bool:
-    if not isinstance(freq, dict):
-        return bool(freq) and str(freq).upper() not in ("UNKNOWN", "UNKNOWN_FREQUENCY")
-    marker = f"{freq.get('label') or ''} {freq.get('resource') or ''}".upper()
-    return bool(marker.strip()) and "UNKNOWN" not in marker
+    if isinstance(freq, dict):
+        freq = f"{pick(freq.get('label')) or ''} {as_str(freq.get('resource')) or ''}"
+    marker = (as_str(freq) or "").strip().upper()
+    return bool(marker) and "UNKNOWN" not in marker
 
 
 def assess_quality(d: dict[str, Any], lang: str = "de", today: date | None = None) -> dict[str, Any]:
     today = today or date.today()
-    dists = [x for x in d.get("distributions") or [] if isinstance(x, dict)]
+    dists = dict_items(d.get("distributions"))
     formats = set(dataset_formats(d))
     desc = clean_text(pick(d.get("description"), lang)) or ""
-    publisher = d.get("publisher") if isinstance(d.get("publisher"), dict) else {}
-    modified = _parse_date(d.get("modified")) or _parse_date((d.get("catalog_record") or {}).get("modified"))
+    publisher = as_dict(d.get("publisher"))
+    modified = _parse_date(d.get("modified")) or _parse_date(as_dict(d.get("catalog_record")).get("modified"))
     age_days = (today - modified).days if modified else None
 
     checks: list[tuple[str, int, bool, str]] = [
@@ -53,7 +64,7 @@ def assess_quality(d: dict[str, Any], lang: str = "de", today: date | None = Non
         (
             "access_urls",
             5,
-            bool(dists) and all(x.get("access_url") or x.get("download_url") for x in dists),
+            bool(dists) and all(first_url(x.get("access_url")) or first_url(x.get("download_url")) for x in dists),
             "Every distribution has an access or download URL",
         ),
         (
@@ -78,7 +89,7 @@ def assess_quality(d: dict[str, Any], lang: str = "de", today: date | None = Non
     score = round(100 * score / total)
     rating = "good" if score >= 80 else "fair" if score >= 55 else "poor"
     return {
-        "dataset_id": d.get("id"),
+        "dataset_id": scalar(d.get("id")),
         "title": clean_text(pick(d.get("title"), lang)),
         "score": score,
         "rating": rating,

@@ -8,12 +8,16 @@ from datagvat_mcp.app import create_app
 from datagvat_mcp.config import get_settings
 
 
+# Loggers that would print every upstream URL, every MCP request or whole response bodies.
+# Upstream requests are logged by datagvat_mcp.client at DEBUG instead (path, status, duration).
+NOISY_LOGGERS = ("httpx", "httpcore", "mcp.server.lowlevel.server", "mcp.server.streamable_http", "sse_starlette.sse")
+
+
 def main() -> None:
     settings = get_settings()
-    level = getattr(logging, settings.log_level.upper(), logging.INFO)
+    level = getattr(logging, settings.log_level)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Don't log every upstream URL / MCP request at INFO.
-    for noisy in ("httpx", "mcp.server.lowlevel.server", "mcp.server.streamable_http"):
+    for noisy in NOISY_LOGGERS:
         logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
     uvicorn.run(
         create_app(settings),

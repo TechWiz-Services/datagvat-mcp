@@ -4,21 +4,25 @@ Files live on many third-party hosts. Downloads go through PublicOnlyTransport
 (SSRF guard), are throttled per host, capped in size, and cached briefly.
 """
 
+import base64
 import csv
 import io
 import json
+import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 
-from datagvat_mcp.cache import MISSING, TTLCache
-from datagvat_mcp.client import user_agent
+from datagvat_mcp.cache import MEMORY_LIMIT, DiskCache, Hit, note_served
+from datagvat_mcp.client import MIN_REFRESH_AGE, user_agent
 from datagvat_mcp.net_guard import PublicOnlyTransport
 from datagvat_mcp.throttle import HostThrottles, ThrottleTimeout
+
+logger = logging.getLogger(__name__)
 
 MAX_PREVIEW_ROWS = 100
 SAMPLE_ROWS_FOR_TYPES = 50
@@ -26,9 +30,17 @@ MAX_CELL_CHARS = 300
 CSV_CONTENT_TYPES = {"text/csv", "application/csv", "text/comma-separated-values", "text/tab-separated-values"}
 JSON_CONTENT_TYPES = {"application/json", "text/json", "application/geo+json", "application/ld+json"}
 
+# Python's default (128 KB per field) is smaller than a preview download; long cells such
+# as WKT geometries must not make the whole file unreadable. Cells are cut for output anyway.
+csv.field_size_limit(16 * 1024 * 1024)
+
 
 class PreviewError(Exception):
     pass
+
+
+class PreviewUnavailable(PreviewError):
+    """The host is down, overloaded or too slow right now (a saved copy may stand in)."""
 
 
 @dataclass
@@ -45,27 +57,63 @@ class PreviewFetcher:
         max_bytes: int,
         timeout: float,
         throttles: HostThrottles,
-        cache_entries: int = 32,
+        cache: DiskCache | None = None,
         cache_ttl: float = 3600,
         contact: str = "",
         transport_factory: Callable[[], httpx.AsyncBaseTransport] = PublicOnlyTransport,
+        blocked_hosts: Iterable[str] = (),
     ):
+        self.blocked_hosts = tuple(h.lower() for h in blocked_hosts)
         self.max_bytes = max_bytes
         self.timeout = timeout
         self.throttles = throttles
-        self.cache = TTLCache(cache_entries)
+        self.cache = cache or DiskCache(None, {"preview": MEMORY_LIMIT})
         self.cache_ttl = cache_ttl
         self.user_agent = user_agent(contact)
         self.transport_factory = transport_factory
 
-    async def fetch(self, url: str) -> Fetched:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise PreviewError("URL must be an absolute http:// or https:// URL")
-        cached = self.cache.get(url)
-        if cached is not MISSING:
-            return cached
+    def _check_host(self, host: str) -> None:
+        host = host.lower().rstrip(".")
+        for blocked in self.blocked_hosts:
+            if host == blocked or host.endswith("." + blocked):
+                raise PreviewError(f"Downloads from {blocked} are disabled on this server")
 
+    async def _check_request(self, request: httpx.Request) -> None:
+        self._check_host(request.url.host)  # runs for every redirect hop too
+
+    async def fetch(self, url: str, refresh: bool = False) -> Fetched:
+        """Download the first part of a file, or take it from the cache.
+
+        `refresh` asks for a new download; it is ignored while the saved copy is
+        only a few minutes old. If the host cannot be reached or is overloaded,
+        a saved copy is returned even when it is past its lifetime.
+        """
+        url = url.strip()  # catalogue metadata sometimes carries stray whitespace
+        try:
+            parsed = urlparse(url)
+            host, _port = parsed.hostname, parsed.port  # .port raises for a port outside 0-65535
+            httpx.URL(url)  # reject what httpx cannot send (control characters, ...)
+        except (ValueError, httpx.InvalidURL) as e:
+            raise PreviewError(f"Invalid URL: {e}") from e
+        if parsed.scheme not in ("http", "https") or not host:
+            raise PreviewError("URL must be an absolute http:// or https:// URL")
+        self._check_host(host)
+        hit = self.cache.get("preview", url)
+        if hit and hit.fresh and not (refresh and self.cache.now() - hit.stored_at >= MIN_REFRESH_AGE):
+            note_served(hit.stored_at, stale=False)
+            return _from_cache(hit)
+        try:
+            result = await self._download(url, host)
+        except PreviewUnavailable as e:
+            if hit is None:
+                raise
+            logger.warning("Serving a saved copy of %s from the cache: %s", url, e)
+            note_served(hit.stored_at, stale=not hit.fresh)
+            return _from_cache(hit)
+        self.cache.set("preview", url, _to_cache(result), self.cache_ttl)
+        return result
+
+    async def _download(self, url: str, host: str) -> Fetched:
         headers = {
             "Range": f"bytes=0-{self.max_bytes - 1}",
             # identity: a ranged slice of a gzip stream cannot be decoded
@@ -73,19 +121,23 @@ class PreviewFetcher:
             "User-Agent": self.user_agent,
         }
         try:
-            async with self.throttles.for_host(parsed.hostname).slot():
+            async with self.throttles.for_host(host).slot():
                 async with httpx.AsyncClient(
                     timeout=self.timeout,
                     follow_redirects=True,
                     max_redirects=5,
                     transport=self.transport_factory(),
                     trust_env=False,  # proxies from env would bypass the SSRF guard
+                    event_hooks={"request": [self._check_request]},
                 ) as client:
                     async with client.stream("GET", url, headers=headers) as resp:
                         if resp.status_code not in (200, 206):
                             if resp.status_code == 404:
                                 raise PreviewError("File not found (HTTP 404)")
-                            raise PreviewError(f"Download failed: HTTP {resp.status_code} {resp.reason_phrase}")
+                            busy = resp.status_code == 429 or resp.status_code >= 500
+                            raise (PreviewUnavailable if busy else PreviewError)(
+                                f"Download failed: HTTP {resp.status_code} {resp.reason_phrase}"
+                            )
                         buf = bytearray()
                         async for chunk in resp.aiter_bytes():
                             buf.extend(chunk)
@@ -96,24 +148,53 @@ class PreviewFetcher:
                         ctype = resp.headers.get("content-type")
                         final_url = str(resp.url)
         except ThrottleTimeout as e:
-            raise PreviewError("Too many downloads queued for this host; try again shortly") from e
+            raise PreviewUnavailable("Too many downloads queued for this host; try again shortly") from e
         except httpx.TimeoutException as e:
-            raise PreviewError("Download timed out") from e
+            raise PreviewUnavailable("Download timed out") from e
         except httpx.ConnectError as e:
-            raise PreviewError(f"Could not connect: {e}") from e
+            raise PreviewUnavailable(f"Could not connect: {e}") from e
         except httpx.RequestError as e:
             raise PreviewError(f"Download failed: {e}") from e
 
-        result = Fetched(content, partial, ctype.split(";")[0].strip().lower() if ctype else None, final_url)
-        self.cache.set(url, result, self.cache_ttl)
-        return result
+        return Fetched(content, partial, ctype.split(";")[0].strip().lower() if ctype else None, final_url)
+
+
+def _to_cache(f: Fetched) -> dict[str, Any]:
+    return {"content": base64.b64encode(f.content).decode(), "partial": f.partial,
+            "content_type": f.content_type, "final_url": f.final_url}
+
+
+def _from_cache(hit: Hit) -> Fetched:
+    v = hit.value
+    return Fetched(base64.b64decode(v["content"]), v["partial"], v["content_type"], v["final_url"])
 
 
 # ---------------------------------------------------------------- decoding
 
 
+_UTF16_BOMS = (b"\xff\xfe", b"\xfe\xff")
+_BINARY_MAGIC = {
+    b"PK\x03\x04": "ZIP archive or Office file (XLSX, ODS, ...)",
+    b"%PDF-": "PDF document",
+    b"\x1f\x8b": "gzip archive",
+    b"\xd0\xcf\x11\xe0": "legacy Office file (XLS, DOC)",
+}
+
+
+def binary_kind(content: bytes) -> str | None:
+    """Name the kind of file if `content` is clearly not text, else None."""
+    for magic, name in _BINARY_MAGIC.items():
+        if content.startswith(magic):
+            return name
+    if not content.startswith(_UTF16_BOMS) and b"\x00" in content[:4096]:
+        return "binary file"
+    return None
+
+
 def decode_text(content: bytes, partial: bool = False) -> tuple[str, str]:
-    """Decode as UTF-8 (tolerating a cut-off final character), else Windows-1252."""
+    """Decode as UTF-8 (tolerating a cut-off final character), UTF-16 with BOM, else Windows-1252."""
+    if content.startswith(_UTF16_BOMS):
+        return content[: len(content) - len(content) % 2].decode("utf-16", errors="replace"), "utf-16"
     try:
         return content.decode("utf-8-sig"), "utf-8"
     except UnicodeDecodeError as e:
@@ -126,6 +207,9 @@ def decode_text(content: bytes, partial: bool = False) -> tuple[str, str]:
 
 
 def detect_format(url: str, content_type: str | None, text: str) -> str | None:
+    head = text.lstrip()[:1]
+    if head == "<":
+        return None  # HTML/XML, e.g. an error or login page served under a .csv URL
     if content_type in CSV_CONTENT_TYPES:
         return "csv"
     if content_type in JSON_CONTENT_TYPES:
@@ -135,11 +219,8 @@ def detect_format(url: str, content_type: str | None, text: str) -> str | None:
         return "csv"
     if path.endswith((".json", ".geojson")):
         return "json"
-    head = text.lstrip()[:1]
     if head in ("{", "["):
         return "json"
-    if head == "<":
-        return None  # HTML/XML
     first = text.split("\n", 1)[0]
     if any(d in first for d in (",", ";", "\t", "|")):
         return "csv"
@@ -214,24 +295,25 @@ def parse_csv(text: str, partial: bool, max_rows: int) -> dict[str, Any]:
         counts = {d: sample.split("\n", 1)[0].count(d) for d in ",;\t|"}
         delimiter = max(counts, key=counts.get) if any(counts.values()) else ","
     reader = csv.reader(io.StringIO(text), delimiter=delimiter, quotechar='"')
-    try:
-        header = [h.strip() for h in next(reader)]
-    except StopIteration as e:
-        raise PreviewError("File is empty") from e
-    if not any(header):
-        raise PreviewError("CSV has no header row")
-
     rows: list[list[str]] = []
     skipped = 0
-    for row in reader:
-        if not any(c.strip() for c in row):
-            continue
-        if len(row) != len(header):
-            skipped += 1
-            continue
-        rows.append(row)
-        if len(rows) >= max(max_rows, SAMPLE_ROWS_FOR_TYPES) + 1:
-            break
+    try:
+        header = [h.strip() for h in next(reader)]
+        if not any(header):
+            raise PreviewError("CSV has no header row")
+        for row in reader:
+            if not any(c.strip() for c in row):
+                continue
+            if len(row) != len(header):
+                skipped += 1
+                continue
+            rows.append(row)
+            if len(rows) >= max(max_rows, SAMPLE_ROWS_FOR_TYPES) + 1:
+                break
+    except StopIteration as e:
+        raise PreviewError("File is empty") from e
+    except csv.Error as e:
+        raise PreviewError(f"Could not read the file as CSV: {e}") from e
     sample_rows = rows[:SAMPLE_ROWS_FOR_TYPES]
     columns = []
     for i, name in enumerate(header):
@@ -367,6 +449,9 @@ def parse_json(text: str, partial: bool, max_rows: int) -> dict[str, Any]:
 
 
 def parse(content: bytes, partial: bool, url: str, content_type: str | None, fmt: str | None, max_rows: int):
+    kind = binary_kind(content)
+    if kind:
+        raise PreviewError(f"Cannot preview this file: it is a {kind}. Only CSV and JSON/GeoJSON are supported.")
     text, encoding = decode_text(content, partial)
     fmt = (fmt or "").lower() or detect_format(url, content_type, text)
     if fmt == "geojson":

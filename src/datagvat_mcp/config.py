@@ -5,6 +5,8 @@ from functools import lru_cache
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from datagvat_mcp.cache import CATEGORIES
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DATAGVAT_", extra="ignore")
@@ -27,22 +29,52 @@ class Settings(BaseSettings):
     contact: str = ""
 
     # --- Politeness: outbound rate limiting and caching ------------------
-    rate_limit: float = Field(1.0, gt=0, le=10, description="sustained requests per second")
-    rate_burst: int = Field(3, ge=1, le=20)
-    max_concurrency: int = Field(1, ge=1, le=4)
+    # One request at a time; this many seconds of pause after each completed request.
+    request_interval: float = Field(2.0, ge=0, le=60)
     queue_timeout: float = Field(60.0, ge=1, le=600)
-    cache_ttl: int = Field(3600, ge=0, description="seconds; search results")
-    cache_ttl_static: int = Field(86400, ge=0, description="seconds; datasets, catalogues, vocabularies")
-    cache_max_entries: int = Field(2000, ge=0)
+
+    # --- Cache -------------------------------------------------------------
+    # Master switch. False: nothing is saved or served from a saved copy, whatever the settings below say.
+    cache_enabled: bool = True
+    # Directory for the cache file. Empty: keep the cache in memory only (lost on restart,
+    # at most 16 MB per category).
+    cache_dir: str = ""
+    # Lifetime in seconds and size limit in MB per kind of answer. 0 switches a kind off.
+    cache_search_ttl: int = Field(6 * 3600, ge=0)  # dataset searches: the portal harvests daily
+    cache_search_max_mb: float = Field(64, ge=0, le=102400)
+    cache_dataset_ttl: int = Field(7 * 86400, ge=0)  # one dataset's metadata
+    cache_dataset_max_mb: float = Field(128, ge=0, le=102400)
+    cache_catalogue_ttl: int = Field(7 * 86400, ge=0)  # catalogue details and catalogue lists
+    cache_catalogue_max_mb: float = Field(16, ge=0, le=102400)
+    cache_vocabulary_ttl: int = Field(30 * 86400, ge=0)  # controlled vocabularies and their terms
+    cache_vocabulary_max_mb: float = Field(32, ge=0, le=102400)
+    cache_preview_ttl: int = Field(3600, ge=0)  # the first part of a data file; files can change daily
+    cache_preview_max_mb: float = Field(64, ge=0, le=102400)
+    # How long past its lifetime an answer is kept to be served when the source cannot be reached.
+    cache_max_stale: int = Field(30 * 86400, ge=0)
 
     # --- Previews of distribution files (third-party hosts) --------------
     preview_max_bytes: int = Field(512 * 1024, ge=4096, le=8 * 1024 * 1024)
-    preview_cache_entries: int = Field(32, ge=0)
+    # Like request_interval, but per file host. Separate, because these are often small
+    # servers of municipalities: speeding up the API must not speed up downloads from them.
+    preview_request_interval: float = Field(2.0, ge=0, le=60)
+    # Hosts (and their subdomains) the preview tools never download from, comma-separated.
+    # Default: the federal legal information system RIS. It has its own strict access rules,
+    # and legal texts are not what this server is for. Set to an empty value to allow it.
+    preview_blocked_hosts: str = "ris.bka.gv.at,data.bka.gv.at"
 
     @field_validator("auth_token", mode="before")
     @classmethod
     def _empty_token_is_none(cls, v):
         return None if v in ("", None) else v
+
+    @field_validator("log_level")
+    @classmethod
+    def _known_log_level(cls, v: str) -> str:
+        v = v.strip().upper()
+        if v not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            raise ValueError("must be DEBUG, INFO, WARNING, ERROR or CRITICAL")
+        return v
 
     @field_validator("path")
     @classmethod
@@ -57,6 +89,20 @@ class Settings(BaseSettings):
     @property
     def allowed_host_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
+
+    def cache_ttl(self, category: str) -> int:
+        return getattr(self, f"cache_{category}_ttl")
+
+    @property
+    def cache_limits(self) -> dict[str, int]:
+        """Size limit in bytes per cache category (all zero when caching is switched off)."""
+        if not self.cache_enabled:
+            return dict.fromkeys(CATEGORIES, 0)
+        return {c: int(getattr(self, f"cache_{c}_max_mb") * 1024 * 1024) for c in CATEGORIES}
+
+    @property
+    def preview_blocked_host_list(self) -> list[str]:
+        return [h.strip().lower().strip(".") for h in self.preview_blocked_hosts.split(",") if h.strip(" .")]
 
     @property
     def token(self) -> str | None:

@@ -3,19 +3,17 @@
 from typing import Any
 
 from datagvat_mcp.client import DataGvAtClient
-from datagvat_mcp.normalize import keyword_labels, pick, summarize_dataset, theme_codes
+from datagvat_mcp.normalize import as_dict, as_str, dict_items, keyword_labels, pick, summarize_dataset, theme_codes
 
 CANDIDATE_FIELDS = ["id", "title", "description", "categories", "keywords", "catalog", "publisher", "modified",
                     "distributions", "is_hvd"]
 
 
 def features(d: dict[str, Any]) -> dict[str, Any]:
-    publisher = d.get("publisher") if isinstance(d.get("publisher"), dict) else {}
-    cat = d.get("catalog") if isinstance(d.get("catalog"), dict) else {}
     return {
         "themes": set(theme_codes(d.get("categories"))),
         "keywords": {k.lower() for k in keyword_labels(d.get("keywords"))},
-        "publisher": pick(publisher.get("name")) or cat.get("id"),
+        "publisher": pick(as_dict(d.get("publisher")).get("name")) or as_str(as_dict(d.get("catalog")).get("id")),
     }
 
 
@@ -41,8 +39,9 @@ async def find_related(
 ) -> dict[str, Any]:
     source = await client.get_dataset(dataset_id)
     src = features(source)
+    source_id = as_str(source.get("id")) or dataset_id
     base = {
-        "source": {"id": source.get("id", dataset_id), "title": pick(source.get("title"), lang)},
+        "source": {"id": source_id, "title": pick(source.get("title"), lang)},
         "source_themes": sorted(src["themes"]),
         "source_keywords": sorted(src["keywords"])[:10],
     }
@@ -54,15 +53,15 @@ async def find_related(
     facets = {"categories": sorted(src["themes"])} if src["themes"] else None
     candidates: list[dict[str, Any]] = []
     result = await client.search(query=query, facets=facets, limit=50, includes=CANDIDATE_FIELDS)
-    candidates += result.get("results") or []
+    candidates += dict_items(result.get("results"))
     if len(candidates) < 20 and query and facets:
         result = await client.search(query=query, limit=30, includes=CANDIDATE_FIELDS)
-        candidates += result.get("results") or []
+        candidates += dict_items(result.get("results"))
 
-    seen = {source.get("id", dataset_id)}
+    seen = {source_id}
     scored = []
     for cand in candidates:
-        cid = cand.get("id")
+        cid = as_str(cand.get("id"))
         if not cid or cid in seen:
             continue
         seen.add(cid)

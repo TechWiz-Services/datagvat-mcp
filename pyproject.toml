@@ -3,6 +3,7 @@ name = "datagvat-mcp"
 version = "2.0.0"
 description = "Self-hosted MCP server for Austrian Open Government Data (data.gv.at)"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12"
 # Exact, hash-verified pins live in requirements.txt (used by the Docker build).
 dependencies = [

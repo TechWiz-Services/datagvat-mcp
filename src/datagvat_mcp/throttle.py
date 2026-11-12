@@ -1,7 +1,9 @@
-"""Outbound request throttling: token bucket + concurrency cap.
+"""Outbound request throttling: one request at a time, with a pause after each.
 
-One Throttle instance is shared by every MCP session in the process, so the
-limit applies to the whole server, not per connected agent.
+The pause starts when a request has *completed* (response fully read), not
+when it was sent, so a slow response never shortens the gap. Requests queue
+in FIFO order. One Throttle is shared by every MCP session in the process, so
+the limit applies to the whole server, not per connected agent.
 """
 
 import asyncio
@@ -17,71 +19,69 @@ class ThrottleTimeout(Exception):
 class Throttle:
     def __init__(
         self,
-        rate: float,
-        burst: int,
-        concurrency: int = 1,
+        interval: float,
         queue_timeout: float = 60.0,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ):
-        if rate <= 0 or burst < 1 or concurrency < 1:
-            raise ValueError("rate must be > 0, burst and concurrency >= 1")
-        self.rate = rate
-        self.capacity = float(burst)
+        if interval < 0:
+            raise ValueError("interval must be >= 0")
+        self.interval = interval
         self.queue_timeout = queue_timeout
-        self._tokens = float(burst)
         self._clock = clock
         self._sleep = sleep
-        self._updated = clock()
-        self._blocked_until = 0.0
-        self._sem = asyncio.Semaphore(concurrency)
-        self._lock = asyncio.Lock()
+        self._next_allowed = 0.0
+        self._lock = asyncio.Lock()  # FIFO: one request in flight at a time
 
     def penalize(self, seconds: float) -> None:
-        """Pause all requests for `seconds` (e.g. after a 429 with Retry-After)."""
-        self._blocked_until = max(self._blocked_until, self._clock() + max(0.0, seconds))
+        """Hold back all requests for at least `seconds` (e.g. after 429 + Retry-After)."""
+        self._next_allowed = max(self._next_allowed, self._clock() + max(0.0, seconds))
 
     @asynccontextmanager
     async def slot(self) -> AsyncIterator[None]:
         deadline = self._clock() + self.queue_timeout
         try:
-            await asyncio.wait_for(self._sem.acquire(), timeout=self.queue_timeout)
+            await asyncio.wait_for(self._lock.acquire(), timeout=self.queue_timeout)
         except TimeoutError as e:
             raise ThrottleTimeout("too many queued requests") from e
+        started = False
         try:
-            await self._take_token(deadline)
-            yield
-        finally:
-            self._sem.release()
-
-    async def _take_token(self, deadline: float) -> None:
-        async with self._lock:
             while True:
                 now = self._clock()
-                if now < self._blocked_until:
-                    wait = self._blocked_until - now
-                else:
-                    self._tokens = min(self.capacity, self._tokens + (now - self._updated) * self.rate)
-                    self._updated = now
-                    if self._tokens >= 1:
-                        self._tokens -= 1
-                        return
-                    wait = (1 - self._tokens) / self.rate
+                wait = self._next_allowed - now
+                if wait <= 0:
+                    break
                 if now + wait > deadline:
                     raise ThrottleTimeout("rate limit queue timeout")
                 await self._sleep(wait)
+            started = True
+            yield
+        finally:
+            if started:  # the pause starts at completion, also when the request failed
+                self._next_allowed = max(self._next_allowed, self._clock() + self.interval)
+            self._lock.release()
 
 
 class HostThrottles:
-    """Lazily created Throttle per host (used for preview downloads)."""
+    """One Throttle per host (used for preview downloads).
 
-    def __init__(self, rate: float, burst: int, queue_timeout: float, max_hosts: int = 256):
-        self._args = (rate, burst, 1, queue_timeout)
+    Hosts can be pre-registered so that, for example, a preview URL that points
+    at data.gv.at itself shares the API throttle instead of getting its own.
+    """
+
+    def __init__(self, interval: float, queue_timeout: float, max_hosts: int = 256):
+        self._args = (interval, queue_timeout)
         self._max_hosts = max_hosts
         self._by_host: dict[str, Throttle] = {}
+        self._pinned: dict[str, Throttle] = {}
+
+    def register(self, host: str, throttle: Throttle) -> None:
+        self._pinned[host.lower()] = throttle
 
     def for_host(self, host: str) -> Throttle:
         host = host.lower()
+        if host in self._pinned:
+            return self._pinned[host]
         t = self._by_host.get(host)
         if t is None:
             if len(self._by_host) >= self._max_hosts:

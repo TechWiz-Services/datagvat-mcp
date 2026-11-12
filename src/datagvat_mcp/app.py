@@ -17,21 +17,25 @@ HEALTH_PATH = "/health"
 
 
 class BearerTokenMiddleware:
-    """Require `Authorization: Bearer <token>` on every HTTP request except /health."""
+    """Require `Authorization: Bearer <token>` on every request except GET /health."""
 
     def __init__(self, app: ASGIApp, token: str | None):
         self.app = app
         self.token = token.encode() if token else None
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if self.token and scope["type"] == "http" and scope["path"] != HEALTH_PATH:
-            auth = dict(scope["headers"]).get(b"authorization", b"")
+        # Everything but the server's own lifespan events is a client connection (http, websocket).
+        if self.token and scope["type"] != "lifespan" and scope.get("path") != HEALTH_PATH:
+            auth = dict(scope.get("headers") or []).get(b"authorization", b"")
             scheme, _, supplied = auth.partition(b" ")
             if scheme.lower() != b"bearer" or not hmac.compare_digest(supplied.strip(), self.token):
-                response = JSONResponse(
-                    {"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Bearer"}
-                )
-                await response(scope, receive, send)
+                if scope["type"] == "http":
+                    response = JSONResponse(
+                        {"error": "unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Bearer"}
+                    )
+                    await response(scope, receive, send)
+                else:
+                    await send({"type": "websocket.close", "code": 1008})
                 return
         await self.app(scope, receive, send)
 

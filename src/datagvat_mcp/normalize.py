@@ -32,6 +32,32 @@ _WS_RE = re.compile(r"[ \t\r\f\v]+")
 _NL_RE = re.compile(r"\n\s*\n+")
 
 
+# The documents come from a third party: never assume a field has the documented type.
+
+
+def as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def as_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def as_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def dict_items(value: Any) -> list[dict[str, Any]]:
+    """The dict elements of a list; a single dict counts as a one-element list."""
+    if isinstance(value, dict):
+        return [value]
+    return [x for x in as_list(value) if isinstance(x, dict)]
+
+
 def pick(value: Any, lang: str = "de") -> str | None:
     """Pick one language from a multilingual value ({"de": .., "en": ..})."""
     if value is None:
@@ -53,6 +79,8 @@ def pick(value: Any, lang: str = "de") -> str | None:
             if v:
                 return v
         return None
+    if isinstance(value, bool):
+        return None
     return str(value)
 
 
@@ -70,23 +98,29 @@ def clean_text(text: str | None, max_len: int | None = None) -> str | None:
 
 
 def first_url(value: Any) -> str | None:
+    """First URL of a string, a list of strings or a list of {"resource": url} objects."""
     if isinstance(value, str):
         return value or None
-    if isinstance(value, list):
-        for v in value:
-            if isinstance(v, str) and v:
-                return v
+    for v in as_list(value):
+        url = as_str(v.get("resource")) if isinstance(v, dict) else as_str(v)
+        if url:
+            return url
     return None
 
 
 def compact(d: dict[str, Any]) -> dict[str, Any]:
     """Drop None / empty values."""
-    return {k: v for k, v in d.items() if v not in (None, "", [], {})}
+    return {k: v for k, v in d.items() if v is not None and v != "" and v != [] and v != {}}
+
+
+def scalar(value: Any) -> str | int | float | None:
+    """Pass a plain value through (dates, ids, sizes); drop anything structured."""
+    return value if isinstance(value, (str, int, float)) and not isinstance(value, bool) else None
 
 
 def theme_codes(categories: Any) -> list[str]:
     out = []
-    for c in categories or []:
+    for c in as_list(categories):
         code = c.get("id") if isinstance(c, dict) else c
         if isinstance(code, str) and code:
             out.append(code.rsplit("/", 1)[-1].upper())
@@ -95,8 +129,8 @@ def theme_codes(categories: Any) -> list[str]:
 
 def keyword_labels(keywords: Any, limit: int | None = None) -> list[str]:
     out = []
-    for k in keywords or []:
-        label = (k.get("label") or k.get("id")) if isinstance(k, dict) else k
+    for k in as_list(keywords):
+        label = (as_str(k.get("label")) or k.get("id")) if isinstance(k, dict) else k
         if isinstance(label, str) and label.strip():
             out.append(label.strip())
     out = list(dict.fromkeys(out))
@@ -105,49 +139,52 @@ def keyword_labels(keywords: Any, limit: int | None = None) -> list[str]:
 
 def format_label(fmt: Any) -> str | None:
     if isinstance(fmt, dict):
-        return fmt.get("id") or fmt.get("label")
-    return fmt if isinstance(fmt, str) and fmt else None
+        return as_str(fmt.get("id")) or as_str(fmt.get("label"))
+    return as_str(fmt)
 
 
 def license_label(lic: Any, lang: str = "de") -> str | None:
     if isinstance(lic, dict):
-        return pick(lic.get("label"), lang) or lic.get("id") or lic.get("resource")
-    return lic if isinstance(lic, str) and lic else None
+        return pick(lic.get("label"), lang) or as_str(lic.get("id")) or as_str(lic.get("resource"))
+    return as_str(lic)
 
 
 def dataset_formats(dataset: dict[str, Any]) -> list[str]:
-    fmts = [format_label(d.get("format")) for d in dataset.get("distributions") or [] if isinstance(d, dict)]
+    fmts = [format_label(d.get("format")) for d in dict_items(dataset.get("distributions"))]
     return sorted({f.upper() for f in fmts if f})
 
 
 def catalogue_ref(dataset: dict[str, Any], lang: str) -> dict[str, Any] | None:
-    cat = dataset.get("catalog")
-    if not isinstance(cat, dict) or not cat.get("id"):
+    cat = as_dict(dataset.get("catalog"))
+    if not as_str(cat.get("id")):
         return None
-    return compact({"id": cat.get("id"), "title": pick(cat.get("title"), lang)})
+    return compact({"id": cat["id"], "title": pick(cat.get("title"), lang)})
 
 
 def dataset_url(dataset: dict[str, Any]) -> str | None:
-    if dataset.get("id"):
+    if as_str(dataset.get("id")):
         return PORTAL_DATASET_URL.format(id=dataset["id"])
-    return dataset.get("resource")
+    return as_str(dataset.get("resource"))
+
+
+def _language_ids(value: Any) -> list[str]:
+    return [x["id"] for x in dict_items(value) if as_str(x.get("id"))]
 
 
 def summarize_dataset(d: dict[str, Any], lang: str = "de", desc_len: int = 280) -> dict[str, Any]:
-    publisher = d.get("publisher") if isinstance(d.get("publisher"), dict) else {}
     return compact(
         {
-            "id": d.get("id"),
+            "id": scalar(d.get("id")),
             "title": clean_text(pick(d.get("title"), lang)),
             "description": clean_text(pick(d.get("description"), lang), desc_len),
-            "publisher": pick(publisher.get("name"), lang),
+            "publisher": pick(as_dict(d.get("publisher")).get("name"), lang),
             "catalogue": catalogue_ref(d, lang),
             "themes": theme_codes(d.get("categories")),
             "keywords": keyword_labels(d.get("keywords"), 8),
             "formats": dataset_formats(d),
-            "modified": d.get("modified"),
-            "issued": d.get("issued"),
-            "high_value_dataset": True if d.get("is_hvd") else None,
+            "modified": scalar(d.get("modified")),
+            "issued": scalar(d.get("issued")),
+            "high_value_dataset": True if d.get("is_hvd") in (True, "true") else None,
             "url": dataset_url(d),
         }
     )
@@ -156,65 +193,56 @@ def summarize_dataset(d: dict[str, Any], lang: str = "de", desc_len: int = 280) 
 def normalize_distribution(dist: dict[str, Any], lang: str = "de") -> dict[str, Any]:
     return compact(
         {
-            "id": dist.get("id"),
+            "id": scalar(dist.get("id")),
             "title": clean_text(pick(dist.get("title"), lang)),
             "format": format_label(dist.get("format")),
-            "media_type": dist.get("media_type") if isinstance(dist.get("media_type"), str) else None,
+            "media_type": as_str(dist.get("media_type")),
             "access_url": first_url(dist.get("access_url")),
             "download_url": first_url(dist.get("download_url")),
             "license": license_label(dist.get("license"), lang),
-            "byte_size": dist.get("byte_size"),
-            "modified": dist.get("modified"),
+            "byte_size": scalar(dist.get("byte_size")),
+            "modified": scalar(dist.get("modified")),
             "description": clean_text(pick(dist.get("description"), lang), 500),
         }
     )
 
 
+def _email(value: Any) -> str | None:
+    return (as_str(value) or "").removeprefix("mailto:") or None
+
+
 def _contacts(value: Any) -> list[dict[str, Any]]:
-    out = []
-    for c in value if isinstance(value, list) else [value] if isinstance(value, dict) else []:
-        if not isinstance(c, dict):
-            continue
-        email = c.get("email")
-        if isinstance(email, str):
-            email = email.removeprefix("mailto:")
-        out.append(compact({"name": pick(c.get("name") or c.get("organisation_name"), "de"), "email": email}))
+    out = [
+        compact({"name": pick(c.get("name") or c.get("organisation_name"), "de"), "email": _email(c.get("email"))})
+        for c in dict_items(value)
+    ]
     return [c for c in out if c]
 
 
 def detail_dataset(d: dict[str, Any], lang: str = "de") -> dict[str, Any]:
     out = summarize_dataset(d, lang, desc_len=4000)
     out["keywords"] = keyword_labels(d.get("keywords"))
-    dists = [normalize_distribution(x, lang) for x in d.get("distributions") or [] if isinstance(x, dict)]
-    publisher = d.get("publisher") if isinstance(d.get("publisher"), dict) else {}
-    temporal = [
-        compact({"from": t.get("gte"), "to": t.get("lte")}) for t in d.get("temporal") or [] if isinstance(t, dict)
-    ]
-    freq = d.get("accrual_periodicity")
+    dists = [normalize_distribution(x, lang) for x in dict_items(d.get("distributions"))]
+    publisher = as_dict(d.get("publisher"))
+    temporal = [compact({"from": scalar(t.get("gte")), "to": scalar(t.get("lte"))}) for t in dict_items(d.get("temporal"))]
+    record = as_dict(d.get("catalog_record"))
+    provenance = [p.get("label") if isinstance(p, dict) else p for p in as_list(d.get("provenance"))]
     out.update(
         compact(
             {
                 "publisher_contact": compact(
-                    {
-                        "homepage": publisher.get("homepage"),
-                        "email": (publisher.get("email") or "").removeprefix("mailto:") or None,
-                    }
+                    {"homepage": first_url(publisher.get("homepage")), "email": _email(publisher.get("email"))}
                 ),
                 "contact_points": _contacts(d.get("contact_point")),
                 "licenses": sorted({x["license"] for x in dists if x.get("license")}),
-                "update_frequency": (pick(freq.get("label"), lang) if isinstance(freq, dict) else None),
+                "update_frequency": pick(as_dict(d.get("accrual_periodicity")).get("label"), lang),
                 "temporal_coverage": [t for t in temporal if t],
-                "languages": [x.get("id") for x in d.get("language") or [] if isinstance(x, dict) and x.get("id")],
-                "landing_page": first_url(
-                    [p.get("resource") if isinstance(p, dict) else p for p in d.get("landing_page") or []]
-                    if isinstance(d.get("landing_page"), list)
-                    else d.get("landing_page")
+                "languages": _language_ids(d.get("language")),
+                "landing_page": first_url(d.get("landing_page")),
+                "provenance": clean_text(pick(provenance, lang), 1500),
+                "catalogue_record": compact(
+                    {"issued": scalar(record.get("issued")), "modified": scalar(record.get("modified"))}
                 ),
-                "provenance": clean_text(
-                    pick([p.get("label") if isinstance(p, dict) else p for p in d.get("provenance") or []], lang),
-                    1500,
-                ),
-                "catalogue_record": compact(d.get("catalog_record") or {}) or None,
                 "distribution_count": len(dists),
                 "distributions": dists,
             }
@@ -224,33 +252,34 @@ def detail_dataset(d: dict[str, Any], lang: str = "de") -> dict[str, Any]:
 
 
 def summarize_catalogue(c: dict[str, Any], lang: str = "de", desc_len: int = 600) -> dict[str, Any]:
-    publisher = c.get("publisher") if isinstance(c.get("publisher"), dict) else {}
     return compact(
         {
-            "id": c.get("id"),
+            "id": scalar(c.get("id")),
             "title": clean_text(pick(c.get("title"), lang)),
             "description": clean_text(pick(c.get("description"), lang), desc_len),
-            "dataset_count": c.get("count"),
-            "publisher": pick(publisher.get("name"), lang),
+            "dataset_count": as_int(c.get("count")),
+            "publisher": pick(as_dict(c.get("publisher")).get("name"), lang),
             "homepage": first_url(c.get("homepage")),
-            "languages": [x.get("id") for x in c.get("language") or [] if isinstance(x, dict) and x.get("id")],
-            "part_of": c.get("is_part_of"),
-            "modified": c.get("modified"),
-            "issued": c.get("issued"),
+            "languages": _language_ids(c.get("language")),
+            "part_of": scalar(c.get("is_part_of")),
+            "modified": scalar(c.get("modified")),
+            "issued": scalar(c.get("issued")),
         }
     )
 
 
+def _count(item: dict[str, Any]) -> int:
+    return as_int(item.get("count")) or 0
+
+
 def normalize_facets(facets: Any, lang: str = "de", top: int = 10) -> dict[str, list[dict[str, Any]]]:
     out: dict[str, list[dict[str, Any]]] = {}
-    for f in facets or []:
-        if not isinstance(f, dict) or not f.get("id"):
-            continue
-        items = [i for i in f.get("items") or [] if isinstance(i, dict) and i.get("count")]
-        items.sort(key=lambda i: -i["count"])
-        if items:
-            out[f["id"]] = [
-                compact({"id": i.get("id"), "title": pick(i.get("title"), lang), "count": i["count"]})
+    for f in dict_items(facets):
+        facet_id = as_str(f.get("id"))
+        items = sorted((i for i in dict_items(f.get("items")) if _count(i) > 0), key=lambda i: -_count(i))
+        if facet_id and items:
+            out[facet_id] = [
+                compact({"id": scalar(i.get("id")), "title": pick(i.get("title"), lang), "count": _count(i)})
                 for i in items[:top]
             ]
     return out
@@ -259,8 +288,8 @@ def normalize_facets(facets: Any, lang: str = "de", top: int = 10) -> dict[str, 
 def vocab_term(t: dict[str, Any], lang: str = "de") -> dict[str, Any]:
     return compact(
         {
-            "id": t.get("id"),
+            "id": scalar(t.get("id")),
             "label": pick(t.get("pref_label") or t.get("label"), lang),
-            "uri": t.get("resource"),
+            "uri": as_str(t.get("resource")),
         }
     )
