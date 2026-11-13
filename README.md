@@ -164,7 +164,7 @@ Public servers in Austria have already been slowed down by AI clients: in August
 
 | Kind of answer | Kept for | Why |
 |---|---|---|
-| Vocabularies | 30 days | Change a few times a year at most |
+| Vocabularies, EuroVoc included | 30 days | Change a few times a year at most. Each page or search is cached on its own; no vocabulary is downloaded whole |
 | Dataset metadata, catalogues | 7 days | Descriptions and links rarely change |
 | Dataset searches | 6 hours | The portal takes in new and changed datasets every day |
 | Beginnings of data files (previews) | 1 hour | Some files are updated daily or more often |
@@ -243,6 +243,6 @@ The code is under the [MIT license](LICENSE).
 This project grew out of [Julian-AT/datagvat-mcp](https://github.com/Julian-AT/datagvat-mcp) by Julian S. (MIT licensed), which showed that an MCP server for data.gv.at is worth having. It started from the code at commit `bf53b23`, and the tool set, the idea of previewing data files and much of the structure come from there. Building on it, this version adds:
 
 - **The official MCP SDK.** The server runs on the official `mcp` package, with 29 pinned dependencies instead of about 90.
-- **Closer fit to the hub-search API.** Distributions, catalogue listings, vocabulary search, related datasets, title sorting, the `OP_DATPRO` theme and the documented query syntax follow what data.gv.at offers. Vocabularies are searched on the server instead of being downloaded whole (EuroVoc alone is 6.5 MB).
+- **Closer fit to the hub-search API.** Distributions, catalogue listings, vocabulary search, related datasets, title sorting, the `OP_DATPRO` theme and the documented query syntax follow what data.gv.at offers. No vocabulary gets special treatment, EuroVoc (7,339 terms, about 6.5 MB) included: terms are looked up on demand, one page or one search at a time, and kept in the regular cache like every other answer.
 - **A focused tool set.** Tools that depend on features data.gv.at does not provide (DOI eligibility needs an API key; metrics, catalogue records, resource types and the gazetteer are not available) gave way to `compare_datasets` and a local metadata quality score.
 - **Politeness and robustness.** Request spacing, a long-lived disk cache with fallback to saved copies, protection against requests to internal addresses in previews, preview support for dead links, Windows-1252, UTF-16, decimal commas and GeoJSON.
