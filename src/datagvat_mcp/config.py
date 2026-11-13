@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # --- Politeness: outbound rate limiting and caching ------------------
     # One request at a time; this many seconds of pause after each completed request.
     request_interval: float = Field(2.0, ge=0, le=60)
-    queue_timeout: float = Field(60.0, ge=1, le=600)
+    queue_timeout: float = Field(30.0, ge=1, le=600)
 
     # --- Cache -------------------------------------------------------------
     # Master switch. False: nothing is saved or served from a saved copy, whatever the settings below say.
@@ -89,6 +89,21 @@ class Settings(BaseSettings):
     @property
     def allowed_host_list(self) -> list[str]:
         return [h.strip() for h in self.allowed_hosts.split(",") if h.strip()]
+
+    def startup_problems(self) -> list[str]:
+        """What stops the server from starting. Empty when the required settings are in place."""
+        problems = []
+        if not (self.token or "").strip():
+            problems.append(
+                "DATAGVAT_AUTH_TOKEN is not set. Every client must authenticate; "
+                "generate a token with: openssl rand -hex 32"
+            )
+        if not self.contact.strip():
+            problems.append(
+                "DATAGVAT_CONTACT is not set. data.gv.at must be able to reach whoever runs this server; "
+                "set it to an e-mail address or a URL"
+            )
+        return problems
 
     def cache_ttl(self, category: str) -> int:
         return getattr(self, f"cache_{category}_ttl")

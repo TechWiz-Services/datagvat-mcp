@@ -13,7 +13,7 @@ This is an unofficial project. It is not affiliated with or endorsed by data.gv.
 
 Images for `linux/amd64` and `linux/arm64` are published to the GitHub Container Registry as `ghcr.io/techwiz-services/datagvat-mcp`. Tags: `latest`, the exact version (`2.0.0`) and the minor version (`2.0`). For a pinned setup use a version tag instead of `latest`, or the image digest.
 
-Example `docker-compose.yml`. Only the two settings you should set yourself are listed; everything else keeps its default (see [Configuration](#configuration)):
+Example `docker-compose.yml`. Only the two required settings are listed; the server does not start without them. Everything else keeps its default (see [Configuration](#configuration)):
 
 ```yaml
 services:
@@ -23,10 +23,10 @@ services:
     ports:
       - "8000:8000"   # remove when only a reverse proxy should reach the container
     environment:
-      # Clients must send "Authorization: Bearer <token>"
-      DATAGVAT_AUTH_TOKEN: ${DATAGVAT_AUTH_TOKEN:?set a token in .env}
-      # Sent to data.gv.at in the User-Agent so they can reach you
-      DATAGVAT_CONTACT: ${DATAGVAT_CONTACT:-}
+      # Required. Clients must send "Authorization: Bearer <token>"
+      DATAGVAT_AUTH_TOKEN: ${DATAGVAT_AUTH_TOKEN:?set DATAGVAT_AUTH_TOKEN in .env}
+      # Required. Sent to data.gv.at in the User-Agent so they can reach you
+      DATAGVAT_CONTACT: ${DATAGVAT_CONTACT:?set DATAGVAT_CONTACT in .env}
     volumes:
       - datagvat-cache:/cache   # keeps saved answers across updates
     read_only: true
@@ -95,15 +95,15 @@ All settings are environment variables. With docker compose, add the ones you wa
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATAGVAT_AUTH_TOKEN` | unset | Require `Authorization: Bearer <token>` on every request except `/health`. Without it, anyone who can reach the port can use the server (a warning is logged at startup) |
+| `DATAGVAT_AUTH_TOKEN` | required | Clients must send `Authorization: Bearer <token>` on every request except `/health`. The server does not start without it |
 | `DATAGVAT_ALLOWED_HOSTS` | unset | Comma-separated `Host` header allowlist (DNS-rebinding protection). Use `host:*` to allow any port |
-| `DATAGVAT_CONTACT` | unset | E-mail address or URL appended to the User-Agent, so data.gv.at can reach you if something goes wrong. Please set it |
+| `DATAGVAT_CONTACT` | required | E-mail address or URL appended to the User-Agent, so data.gv.at can reach you if something goes wrong. The server does not start without it |
 | `DATAGVAT_HOST` / `DATAGVAT_PORT` / `DATAGVAT_PATH` | `0.0.0.0` / `8000` / `/mcp` | Listen address, port and MCP endpoint path |
 | `DATAGVAT_STATELESS` | `false` | Stateless HTTP: no sessions and no sampling |
 | `DATAGVAT_LANGUAGE` | `de` | Preferred language for labels (falls back to de, then en) |
 | `DATAGVAT_REQUEST_INTERVAL` | `2` | Seconds to pause after each answer from data.gv.at before the next request is sent. Requests are never sent in parallel |
 | `DATAGVAT_PREVIEW_REQUEST_INTERVAL` | `2` | The same pause for preview downloads, counted per file host. It is separate so that a faster API setting does not speed up downloads from publishers' servers, which are often small |
-| `DATAGVAT_QUEUE_TIMEOUT` | `60` | Seconds a request may wait for its turn before the tool reports "busy" |
+| `DATAGVAT_QUEUE_TIMEOUT` | `30` | Seconds a request may wait for its turn before the tool reports "busy" |
 | `DATAGVAT_CACHE_ENABLED` | `true` | Master switch for the cache. `false`: nothing is saved and no saved copy is ever served, so every tool call goes to data.gv.at. Leave it on unless you are debugging |
 | `DATAGVAT_CACHE_DIR` | `/cache` in the image, otherwise unset | Directory for the cache file. Unset or not writable: the cache lives in memory, is lost on restart and holds at most 16 MB per kind |
 | `DATAGVAT_CACHE_SEARCH_TTL` / `DATAGVAT_CACHE_SEARCH_MAX_MB` | `21600` (6 h) / `64` | Dataset searches: lifetime in seconds and size limit in MB |
@@ -113,7 +113,7 @@ All settings are environment variables. With docker compose, add the ones you wa
 | `DATAGVAT_CACHE_PREVIEW_TTL` / `DATAGVAT_CACHE_PREVIEW_MAX_MB` | `3600` (1 h) / `64` | Downloaded beginnings of data files |
 | `DATAGVAT_CACHE_MAX_STALE` | `2592000` (30 d) | How long past its lifetime an answer is kept as a fallback for when the source cannot be reached. `0` turns the fallback off |
 | `DATAGVAT_PREVIEW_MAX_BYTES` | `524288` | Maximum bytes downloaded per preview |
-| `DATAGVAT_PREVIEW_BLOCKED_HOSTS` | `ris.bka.gv.at,data.bka.gv.at` | Hosts (including subdomains) the preview tools never download from. The default blocks the legal information system RIS; see [below](#ris-is-blocked-by-default). Set it to an empty value to allow everything |
+| `DATAGVAT_PREVIEW_BLOCKED_HOSTS` | `ris.bka.gv.at,data.bka.gv.at` | Hosts (including subdomains) the preview tools never download from. The default is explained [below](#ris-is-blocked-by-default) |
 | `DATAGVAT_REQUEST_TIMEOUT` | `30` | Upstream timeout in seconds |
 | `DATAGVAT_API_BASE` | `https://www.data.gv.at/api/hub/search` | Address of the hub-search API. Only change it for testing |
 | `DATAGVAT_LOG_LEVEL` | `INFO` | Log level |
@@ -183,14 +183,14 @@ The server never calls the RIS interface itself. But data.gv.at lists RIS datase
 - RIS has the strict access rules quoted above, and it is the service that was [disrupted by AI bots](https://orf.at/stories/3439709/) in 2026. This server should not add to that.
 - This server is meant for everyday open data. Legal texts fetched by an agent invite answers that look like legal advice.
 
-RIS datasets still show up in search results with their metadata and links. If you know what you are doing and keep to the RIS rules, set `DATAGVAT_PREVIEW_BLOCKED_HOSTS=` (empty) or list other hosts there.
+RIS datasets still show up in search results with their metadata and links.
 
 ### What you should do when you run it
 
-- **Set `DATAGVAT_CONTACT`** to an address where you can be reached. Without it, data.gv.at sees an anonymous client and can only block it.
+- **Use a contact address you read in `DATAGVAT_CONTACT`.** It is required. Without one, data.gv.at sees an anonymous client and can only block it.
 - **Keep the default interval**, or raise it. `DATAGVAT_REQUEST_INTERVAL=0` removes the pause and is meant for tests against your own mock, not for data.gv.at.
 - **Do not use it for bulk harvesting.** It is built for agents that answer questions. If you need large parts of the catalogue, ask data.gv.at how they want that done.
-- **Set `DATAGVAT_AUTH_TOKEN`** if anyone else can reach the port. Requests made through your server come from your IP address and are your responsibility.
+- **Keep `DATAGVAT_AUTH_TOKEN` long and secret.** It is required. Requests made through your server come from your IP address and are your responsibility.
 - **Attribute the data** in whatever you build or publish with it, as the dataset's licence requires.
 - If you offer a public service on top of it, **register it** with data.gv.at as the netiquette asks, and choose a name that cannot be mistaken for an official one.
 

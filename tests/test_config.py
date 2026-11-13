@@ -101,6 +101,18 @@ async def test_default_services_block_ris_previews():
         await svc.client.close()
 
 
+def test_the_queue_gives_up_after_30_seconds_by_default():
+    assert Settings().queue_timeout == 30
+
+
+def test_token_and_contact_are_required_to_serve():
+    assert len(Settings().startup_problems()) == 2
+    assert Settings(auth_token="t", contact="ops@example.org").startup_problems() == []
+    assert len(Settings(auth_token="  ", contact="ops@example.org").startup_problems()) == 1
+    assert len(Settings(auth_token="t", contact="  ").startup_problems()) == 1
+    assert Settings(auth_token="t", contact="https://example.org/ops").startup_problems() == []
+
+
 def test_log_level_is_normalised_and_checked():
     assert Settings().log_level == "INFO"
     assert Settings(log_level=" debug ").log_level == "DEBUG"

@@ -1,6 +1,7 @@
 """Run the server: python -m datagvat_mcp"""
 
 import logging
+import sys
 
 import uvicorn
 
@@ -15,6 +16,9 @@ NOISY_LOGGERS = ("httpx", "httpcore", "mcp.server.lowlevel.server", "mcp.server.
 
 def main() -> None:
     settings = get_settings()
+    problems = settings.startup_problems()
+    if problems:  # exits with a non-zero status and the reasons on stderr
+        sys.exit("datagvat-mcp cannot start:\n  - " + "\n  - ".join(problems))
     level = getattr(logging, settings.log_level)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     for noisy in NOISY_LOGGERS:

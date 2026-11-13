@@ -53,12 +53,23 @@ def _same(a: str, b: str) -> bool:
         return a.strip().lower() == b.strip().lower()
 
 
+REQUIRED = {"DATAGVAT_AUTH_TOKEN", "DATAGVAT_CONTACT"}  # the server refuses to start without them
+
+
+def test_required_settings_are_what_the_code_demands():
+    named = {re.match(r"DATAGVAT_[A-Z_]+", problem).group(0) for problem in Settings().startup_problems()}
+    assert named == REQUIRED
+
+
 def test_compose_and_env_example_state_the_real_defaults():
     defaults = {f"DATAGVAT_{k.upper()}": "" if v is None else str(v) for k, v in Settings().model_dump().items()}
     defaults["DATAGVAT_CACHE_DIR"] = "/cache"  # set by the image
-    compose = dict(re.findall(r"^\s+(DATAGVAT_[A-Z0-9_]+): \$\{\1:?-([^}]*)\}$", read("docker-compose.yml"), re.M))
+    compose_text = read("docker-compose.yml")
+    compose = dict(re.findall(r"^\s+(DATAGVAT_[A-Z0-9_]+): \$\{\1:?-([^}]*)\}$", compose_text, re.M))
+    required = set(re.findall(r"^\s+(DATAGVAT_[A-Z0-9_]+): \$\{\1:\?[^}]+\}$", compose_text, re.M))
     example = dict(re.findall(r"^#?(DATAGVAT_[A-Z0-9_]+)=(.*)$", read(".env.example"), re.M))
-    assert set(compose) == set(example) == SETTINGS  # each passed through under its own name
+    assert required == REQUIRED  # compose refuses to run without them, with a message
+    assert set(compose) | required == set(example) == SETTINGS  # each passed through under its own name
     for source, values in (("docker-compose.yml", compose), (".env.example", example)):
         wrong = {k: v for k, v in values.items() if not _same(v, defaults[k])}
         assert not wrong, f"{source} states other defaults than the code: {wrong}"
@@ -75,6 +86,9 @@ def test_readme_states_the_real_defaults():
     row = re.search(r"\| `DATAGVAT_PREVIEW_MAX_BYTES` \| `(\d+)` \|", readme)
     assert row and int(row.group(1)) == defaults.preview_max_bytes
     assert f"`{defaults.api_base}`" in readme
+    for name in sorted(REQUIRED):  # the table and the compose example both say it is required
+        assert re.search(rf"\| `{name}` \| required \|", readme), name
+        assert f"${{{name}:?" in readme, name
 
 
 async def test_readme_lists_every_tool_resource_and_prompt():
