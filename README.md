@@ -223,17 +223,26 @@ src/datagvat_mcp/
 tests/           pytest suite (offline; test_live.py opt-in)
 ```
 
+## Contributing
+
+Contributions are welcome: issues, ideas and pull requests. A pull request must keep the test suite passing, and it has to respect these core requirements:
+
+1. **No harm to data.gv.at.** Running this service without modification must never cause any issues for data.gv.at.
+2. **Their rules are the ceiling.** The data.gv.at netiquette, and any rules or regulations that may be released for this API in the future, must be observed as absolute maximums.
+3. **Nothing related to RIS.** Do not add anything that touches the legal information system RIS.
+4. **Security is never reduced.** Multi-user support may be added, but authentication must not be removed.
+
 ## License
 
 The code is under the [MIT license](LICENSE).
 
 **The data is not.** This server only gives access to data published by third parties. The MIT license covers this software, not what it fetches. Each dataset has its own license, shown in the `licenses` field of `get_dataset` and in every distribution. Most Austrian open data is [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.de), which requires naming the rights holder, but some datasets use other licenses or terms (for example CC BY-SA, CC0 or the older CC BY 3.0 AT). Metadata from data.gv.at and the files on the publishers' servers can differ in this. If you use or republish data you obtained through this server, check and follow the license of that dataset. The server's instructions ask agents to name publisher and license when they pass data on, but that is no substitute for checking.
 
-## Origin
+## Acknowledgements
 
-Based on [Julian-AT/datagvat-mcp](https://github.com/Julian-AT/datagvat-mcp) (MIT, as declared in its `pyproject.toml`), reviewed at commit `bf53b23`. The review found no backdoors, telemetry or obfuscated code. The server was then largely rewritten:
+This project grew out of [Julian-AT/datagvat-mcp](https://github.com/Julian-AT/datagvat-mcp) by Julian S. (MIT licensed), which showed that an MCP server for data.gv.at is worth having. It started from the code at commit `bf53b23`, and the tool set, the idea of previewing data files and much of the structure come from there. Building on it, this version adds:
 
-- **Framework.** It moved from fastmcp 2.x (~90 dependencies) to the official `mcp` SDK (29).
-- **API target.** It now uses data.gv.at's hub-search API correctly. Upstream called endpoints that don't exist there (`/distributions`, `/metrics`, `/record`), listed catalogues as bare IDs, downloaded whole vocabularies (EuroVoc is 6.5 MB) to search them, used a wrong facet name for related datasets and a non-working title sort, misdocumented the query syntax, missed the `OP_DATPRO` theme, mis-parsed sampling results and passed list-typed prompt arguments.
-- **Removed tools.** Upstream tools that cannot work against data.gv.at were dropped: DOI eligibility (needs an API key), metrics, catalogue records, resource types and the gazetteer (broken on the server side).
-- **Added.** Rate limiting, caching, the SSRF fix, preview fallbacks for dead links, Windows-1252/UTF-16/decimal-comma/GeoJSON support, a local quality score and `compare_datasets` were added.
+- **The official MCP SDK.** The server runs on the official `mcp` package, with 29 pinned dependencies instead of about 90.
+- **Closer fit to the hub-search API.** Distributions, catalogue listings, vocabulary search, related datasets, title sorting, the `OP_DATPRO` theme and the documented query syntax follow what data.gv.at offers. Vocabularies are searched on the server instead of being downloaded whole (EuroVoc alone is 6.5 MB).
+- **A focused tool set.** Tools that depend on features data.gv.at does not provide (DOI eligibility needs an API key; metrics, catalogue records, resource types and the gazetteer are not available) gave way to `compare_datasets` and a local metadata quality score.
+- **Politeness and robustness.** Request spacing, a long-lived disk cache with fallback to saved copies, protection against requests to internal addresses in previews, preview support for dead links, Windows-1252, UTF-16, decimal commas and GeoJSON.
