@@ -72,6 +72,8 @@ def test_token_is_not_exposed_by_repr_or_dump():
     "overrides",
     [
         {"request_interval": -1}, {"request_interval": 61}, {"queue_timeout": 0}, {"port": 0}, {"port": 70000},
+        {"request_interval": 0}, {"request_interval": 0.49}, {"preview_request_interval": 0},
+        {"preview_request_interval": 0.1}, {"preview_request_interval": 61},
         {"request_timeout": 1}, {"preview_max_bytes": 100}, {"preview_max_bytes": 64 * 1024 * 1024},
         {"cache_search_ttl": -1}, {"cache_dataset_max_mb": -1}, {"cache_max_stale": -1}, {"stateless": "maybe"},
     ],
@@ -99,6 +101,19 @@ async def test_default_services_block_ris_previews():
             await svc.preview.fetch("https://data.bka.gv.at/ris/api/v2.6/Bundesrecht")
     finally:
         await svc.client.close()
+
+
+def test_the_pause_between_requests_has_a_floor_of_half_a_second(monkeypatch):
+    from datagvat_mcp.config import MIN_REQUEST_INTERVAL
+
+    assert MIN_REQUEST_INTERVAL == 0.5
+    assert Settings(request_interval=0.5, preview_request_interval=0.5).request_interval == 0.5  # the floor itself
+    assert Settings().request_interval == Settings().preview_request_interval == 2.0
+    for name in ("DATAGVAT_REQUEST_INTERVAL", "DATAGVAT_PREVIEW_REQUEST_INTERVAL"):
+        monkeypatch.setenv(name, "0.4")  # also through the environment, where an operator would set it
+        with pytest.raises(ValidationError, match="greater than or equal to 0.5"):
+            Settings()
+        monkeypatch.delenv(name)
 
 
 def test_the_queue_gives_up_after_30_seconds_by_default():

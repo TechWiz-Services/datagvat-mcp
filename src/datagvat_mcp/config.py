@@ -7,6 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from datagvat_mcp.cache import CATEGORIES
 
+MIN_REQUEST_INTERVAL = 0.5  # seconds; the shortest pause between requests the server accepts
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="DATAGVAT_", extra="ignore")
@@ -30,7 +32,8 @@ class Settings(BaseSettings):
 
     # --- Politeness: outbound rate limiting and caching ------------------
     # One request at a time; this many seconds of pause after each completed request.
-    request_interval: float = Field(2.0, ge=0, le=60)
+    # Never below MIN_REQUEST_INTERVAL: such a value is rejected at startup.
+    request_interval: float = Field(2.0, ge=MIN_REQUEST_INTERVAL, le=60)
     queue_timeout: float = Field(30.0, ge=1, le=600)
 
     # --- Cache -------------------------------------------------------------
@@ -57,7 +60,7 @@ class Settings(BaseSettings):
     preview_max_bytes: int = Field(512 * 1024, ge=4096, le=8 * 1024 * 1024)
     # Like request_interval, but per file host. Separate, because these are often small
     # servers of municipalities: speeding up the API must not speed up downloads from them.
-    preview_request_interval: float = Field(2.0, ge=0, le=60)
+    preview_request_interval: float = Field(2.0, ge=MIN_REQUEST_INTERVAL, le=60)
     # Hosts (and their subdomains) the preview tools never download from, comma-separated.
     # Default: the federal legal information system RIS. It has its own strict access rules,
     # and legal texts are not what this server is for. Set to an empty value to allow it.

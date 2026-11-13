@@ -7,7 +7,7 @@ import httpx
 import pytest
 from starlette.testclient import TestClient
 
-from conftest import DATASET, make_settings
+from conftest import DATASET, instant_throttle, make_settings
 from datagvat_mcp import server
 from datagvat_mcp.app import BearerTokenMiddleware, create_app
 from datagvat_mcp.client import DataGvAtClient
@@ -31,7 +31,7 @@ def client_factory(fake_api):
         # Built here, used on the app's own event loop: nothing in it is bound to a loop yet.
         server.set_services(server.Services(
             settings=settings,
-            client=DataGvAtClient(settings, transport=httpx.MockTransport(fake_api)),
+            client=DataGvAtClient(settings, transport=httpx.MockTransport(fake_api), throttle=instant_throttle()),
             preview=PreviewFetcher(max_bytes=1000, timeout=5, throttles=HostThrottles(0, 5),
                                    transport_factory=lambda: httpx.MockTransport(lambda r: httpx.Response(404))),
         ))

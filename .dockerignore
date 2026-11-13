@@ -6,6 +6,7 @@
 !tests/
 # only for the test stage (tests/test_docs.py); not copied into the runtime image
 !README.md
+!docs/
 !.env.example
 !docker-compose.yml
 !Dockerfile

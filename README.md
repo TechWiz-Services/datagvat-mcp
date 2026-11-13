@@ -91,7 +91,7 @@ Search tips (this is how the data.gv.at search engine behaves): German terms wor
 
 ## Configuration
 
-All settings are environment variables. With docker compose, add the ones you want to change under `environment:`.
+All settings are environment variables. With docker compose, add the ones you want to change under `environment:`. The complete reference, with ranges and internals, is in [docs/TECHNICAL.md](docs/TECHNICAL.md).
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -101,8 +101,6 @@ All settings are environment variables. With docker compose, add the ones you wa
 | `DATAGVAT_HOST` / `DATAGVAT_PORT` / `DATAGVAT_PATH` | `0.0.0.0` / `8000` / `/mcp` | Listen address, port and MCP endpoint path |
 | `DATAGVAT_STATELESS` | `false` | Stateless HTTP: no sessions and no sampling |
 | `DATAGVAT_LANGUAGE` | `de` | Preferred language for labels (falls back to de, then en) |
-| `DATAGVAT_REQUEST_INTERVAL` | `2` | Seconds to pause after each answer from data.gv.at before the next request is sent. Requests are never sent in parallel |
-| `DATAGVAT_PREVIEW_REQUEST_INTERVAL` | `2` | The same pause for preview downloads, counted per file host. It is separate so that a faster API setting does not speed up downloads from publishers' servers, which are often small |
 | `DATAGVAT_QUEUE_TIMEOUT` | `30` | Seconds a request may wait for its turn before the tool reports "busy" |
 | `DATAGVAT_CACHE_ENABLED` | `true` | Master switch for the cache. `false`: nothing is saved and no saved copy is ever served, so every tool call goes to data.gv.at. Leave it on unless you are debugging |
 | `DATAGVAT_CACHE_DIR` | `/cache` in the image, otherwise unset | Directory for the cache file. Unset or not writable: the cache lives in memory, is lost on restart and holds at most 16 MB per kind |
@@ -151,11 +149,11 @@ In August 2026 Austrian media reported that RIS was slowed down by automated req
 
 ### How this server behaves
 
-- **One request at a time, then a pause.** All connected agents share one queue. After each answer from data.gv.at the server waits `DATAGVAT_REQUEST_INTERVAL` (2 s) before sending the next request. The pause starts when the answer has arrived, so slow answers are never followed more quickly. A tool call that needs several documents therefore takes a few seconds.
+- **One request at a time, then a pause.** All connected agents share one queue. After each answer from data.gv.at the server waits 2 s before sending the next request. The pause can be configured, but never below 0.5 s. The pause starts when the answer has arrived, so slow answers are never followed more quickly. A tool call that needs several documents therefore takes a few seconds.
 - **It backs off.** On HTTP 429 or 503 it waits as long as `Retry-After` says (and gives up instead of waiting more than 30 s). Every other queued request waits too.
 - **It asks once.** Answers are cached for a long time (see [Caching](#caching)), identical requests made at the same time share one upstream call, and tools request only the fields they need.
 - **It identifies itself.** The User-Agent is `datagvat-mcp/<version> (self-hosted MCP server; httpx)`, followed by your `DATAGVAT_CONTACT`.
-- **Publishers' file servers get the same treatment.** Previews are fetched one at a time per host with a pause of their own (`DATAGVAT_PREVIEW_REQUEST_INTERVAL`, also 2 s), with a `Range` request for the first 512 KB only, and are cached. Files hosted on data.gv.at itself count against the API's queue.
+- **Publishers' file servers get the same treatment.** Previews are fetched one at a time per host with a pause of their own (also 2 s, same floor), with a `Range` request for the first 512 KB only, and are cached. Files hosted on data.gv.at itself count against the API's queue.
 - **It tells agents the rules.** The server instructions ask agents to prefer few, specific calls, not to page through large result sets, and to name publisher and licence when they pass data on.
 
 ### Caching
@@ -188,7 +186,7 @@ RIS datasets still show up in search results with their metadata and links.
 ### What you should do when you run it
 
 - **Use a contact address you read in `DATAGVAT_CONTACT`.** It is required. Without one, data.gv.at sees an anonymous client and can only block it.
-- **Keep the default interval**, or raise it. `DATAGVAT_REQUEST_INTERVAL=0` removes the pause and is meant for tests against your own mock, not for data.gv.at.
+- **Keep the default pause between requests**, or raise it. The server does not accept less than 0.5 s.
 - **Do not use it for bulk harvesting.** It is built for agents that answer questions. If you need large parts of the catalogue, ask data.gv.at how they want that done.
 - **Keep `DATAGVAT_AUTH_TOKEN` long and secret.** It is required. Requests made through your server come from your IP address and are your responsibility.
 - **Attribute the data** in whatever you build or publish with it, as the dataset's licence requires.
@@ -203,25 +201,7 @@ RIS datasets still show up in search results with their metadata and links.
 
 ## Development
 
-The offline test suite runs inside the Docker build, so a failing test means no image. `tests/test_live.py` is skipped unless `DATAGVAT_LIVE_TESTS=1` is set; it sends a handful of requests (spaced like every other request) to verify that the API still looks the way the server expects. It is worth running when data.gv.at changes something. To update dependencies, run `scripts/update-requirements.sh` and review the diff.
-
-Releases: set the new version in `pyproject.toml` and `src/datagvat_mcp/__init__.py` (a test checks that they match), commit, then push a tag `v<version>`. The workflow in `.github/workflows/publish.yml` builds the image for both architectures, runs the test suite inside the build and publishes it. Every push and pull request also runs the test suite (`.github/workflows/ci.yml`). The GitHub Actions used are pinned to commit hashes, like the Python dependencies.
-
-Layout:
-
-```
-src/datagvat_mcp/
-  server.py      MCP tools, resources, prompts
-  client.py      data.gv.at hub-search client (retries, request coalescing, stale fallback)
-  cache.py       SQLite answer cache with a lifetime and size limit per kind of answer
-  throttle.py    one request at a time with a pause after each, shared by all sessions
-  normalize.py   compact single-language views of API documents
-  preview.py     guarded partial downloads + CSV/JSON/GeoJSON parsing
-  net_guard.py   SSRF guard transport
-  quality.py, similarity.py, semantic.py
-  app.py         ASGI app: /health, bearer auth; __main__.py starts uvicorn
-tests/           pytest suite (offline; test_live.py opt-in)
-```
+Code layout, tests and releases are described in [docs/TECHNICAL.md](docs/TECHNICAL.md). The offline test suite runs inside the Docker build, so a failing test means no image.
 
 ## Contributing
 

@@ -2,7 +2,7 @@ import json
 
 import httpx
 
-from conftest import DATASET, DATASET_2, DATASET_3, make_settings
+from conftest import DATASET, DATASET_2, DATASET_3, instant_throttle, make_settings
 from datagvat_mcp.client import DataGvAtClient
 from datagvat_mcp.similarity import features, find_related, similarity
 
@@ -22,7 +22,7 @@ def test_similarity_is_capped():
 
 
 async def test_find_related_queries_by_keywords_within_themes(fake_api):
-    client = DataGvAtClient(make_settings(), transport=httpx.MockTransport(fake_api))
+    client = DataGvAtClient(make_settings(), transport=httpx.MockTransport(fake_api), throttle=instant_throttle())
     r = await find_related(client, DATASET["id"], limit=5, min_score=20)
     search = fake_api.calls("/search")[0].url.params
     assert json.loads(search["facets"]) == {"categories": ["SOCI"]}
@@ -36,7 +36,7 @@ async def test_find_related_queries_by_keywords_within_themes(fake_api):
 
 
 async def test_find_related_without_features(fake_api):
-    client = DataGvAtClient(make_settings(), transport=httpx.MockTransport(fake_api))
+    client = DataGvAtClient(make_settings(), transport=httpx.MockTransport(fake_api), throttle=instant_throttle())
     fake_api.datasets["bare"] = {"id": "bare", "title": {"de": "x"}}
     r = await find_related(client, "bare")
     assert r["related"] == [] and "no themes" in r["note"]

@@ -5,7 +5,6 @@ import os
 
 import pytest
 import uvicorn
-from pydantic import ValidationError
 
 from datagvat_mcp import __main__ as entry
 from datagvat_mcp import server
@@ -61,8 +60,38 @@ def test_environment_is_applied(started):
 
 
 def test_invalid_configuration_stops_the_start(started):
-    with pytest.raises(ValidationError, match="DEBUG, INFO"):
+    with pytest.raises(SystemExit) as stop:
         started(DATAGVAT_LOG_LEVEL="chatty")  # uvicorn would otherwise die later with a bare KeyError
+    message = str(stop.value.code)
+    assert "invalid settings" in message and "DATAGVAT_LOG_LEVEL" in message and "DEBUG, INFO" in message
+    assert "Traceback" not in message and "request_interval" not in message
+
+
+@pytest.mark.parametrize("name", ["DATAGVAT_REQUEST_INTERVAL", "DATAGVAT_PREVIEW_REQUEST_INTERVAL"])
+@pytest.mark.parametrize("value", ["0", "0.1", "0.49", "-1"])
+def test_a_pause_below_half_a_second_stops_the_start(started, name, value):
+    with pytest.raises(SystemExit) as stop:
+        started(**{name: value})
+    message = str(stop.value.code)
+    assert name in message and "greater than or equal to 0.5" in message and f"got '{value}'" in message
+
+
+def test_the_lowest_allowed_pause_starts(started):
+    assert callable(started(DATAGVAT_REQUEST_INTERVAL="0.5", DATAGVAT_PREVIEW_REQUEST_INTERVAL="0.5")["app"])
+
+
+def test_several_invalid_settings_are_all_reported(started):
+    with pytest.raises(SystemExit) as stop:
+        started(DATAGVAT_PORT="0", DATAGVAT_QUEUE_TIMEOUT="0", DATAGVAT_REQUEST_INTERVAL="0.2")
+    message = str(stop.value.code)
+    assert all(n in message for n in ("DATAGVAT_PORT", "DATAGVAT_QUEUE_TIMEOUT", "DATAGVAT_REQUEST_INTERVAL"))
+
+
+def test_an_invalid_value_is_shown_but_never_the_token(started):
+    # A token cannot be invalid on its own, but a refusal caused by another setting must not echo it.
+    with pytest.raises(SystemExit) as stop:
+        started(DATAGVAT_AUTH_TOKEN="s3cret-value", DATAGVAT_PORT="0")
+    assert "s3cret-value" not in str(stop.value.code) and "DATAGVAT_PORT" in str(stop.value.code)
 
 
 # ------------------------------------------------- required settings

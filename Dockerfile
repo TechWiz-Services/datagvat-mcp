@@ -23,6 +23,7 @@ RUN pip install --require-hashes --only-binary=:all: --no-deps -r /tmp/requireme
 WORKDIR /build
 # The docs and example files are checked against the code by tests/test_docs.py.
 COPY pyproject.toml README.md .env.example docker-compose.yml Dockerfile ./
+COPY docs/ docs/
 COPY src/ src/
 COPY tests/ tests/
 RUN python -m pytest && echo ok > /build/tests-passed

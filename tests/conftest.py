@@ -13,7 +13,7 @@ from datagvat_mcp.client import DataGvAtClient
 from datagvat_mcp.config import Settings
 from datagvat_mcp.preview import PreviewFetcher
 from datagvat_mcp.server import Services, set_services
-from datagvat_mcp.throttle import HostThrottles
+from datagvat_mcp.throttle import HostThrottles, Throttle
 
 API = "https://api.test/api/hub/search"
 
@@ -116,9 +116,14 @@ class FakeClock:
         await asyncio.sleep(0)
 
 
+def instant_throttle() -> Throttle:
+    """One request at a time but no pause: tests must not wait (Settings rejects intervals below 0.5 s)."""
+    return Throttle(0, 5)
+
+
 def make_settings(**overrides) -> Settings:
     base = dict(
-        api_base=API, request_interval=0, queue_timeout=5,
+        api_base=API, request_interval=0.5, queue_timeout=5,  # 0.5 s is the lowest value Settings accepts
         cache_dir="", contact="", auth_token=None, allowed_hosts="",
     )
     base.update(overrides)
@@ -216,7 +221,7 @@ async def services(settings, fake_api, preview_files, no_retry_sleep):
         handler = preview_files.get(str(request.url))
         return handler(request) if handler else httpx.Response(404)
 
-    client = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api))
+    client = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api), throttle=instant_throttle())
     svc = Services(
         settings=settings,
         client=client,

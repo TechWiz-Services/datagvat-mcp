@@ -12,9 +12,11 @@ from datagvat_mcp.config import Settings
 from datagvat_mcp.server import INSTRUCTIONS, build_server
 
 ROOT = Path(__file__).resolve().parents[1]
-DOCUMENTED_IN = ["README.md", ".env.example", "docker-compose.yml", "Dockerfile"]
+DOCUMENTED_IN = ["README.md", "docs/TECHNICAL.md", ".env.example", "docker-compose.yml", "Dockerfile"]
 SETTINGS = {f"DATAGVAT_{name.upper()}" for name in Settings.model_fields}
 NOT_SETTINGS = {"DATAGVAT_LIVE_TESTS"}  # switches the live tests on; read by the test suite only
+# Left out of the README on purpose (it is for newcomers); the technical reference has them.
+HIDDEN_FROM_README = {"DATAGVAT_REQUEST_INTERVAL", "DATAGVAT_PREVIEW_REQUEST_INTERVAL"}
 
 
 def read(name: str) -> str:
@@ -37,7 +39,48 @@ def test_only_existing_settings_are_mentioned(name):
 
 def test_every_setting_is_documented_in_the_readme():
     mentioned = set(re.findall(r"DATAGVAT_[A-Z0-9_]+", read("README.md")))
-    assert SETTINGS - mentioned == set(), "settings missing from the README's configuration table"
+    assert SETTINGS - HIDDEN_FROM_README - mentioned == set(), "settings missing from the README's table"
+    assert mentioned & HIDDEN_FROM_README == set(), "the README is meant not to mention these settings"
+    assert "docs/TECHNICAL.md" in read("README.md")
+
+
+def _technical_rows() -> dict[str, str]:
+    """Variable name -> the rest of its table row in docs/TECHNICAL.md."""
+    return dict(re.findall(r"^\| `((?:DATAGVAT_|FORWARDED_)[A-Z0-9_]+)` \| (.+) \|$", read("docs/TECHNICAL.md"), re.M))
+
+
+def _bound(value) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
+
+
+def test_technical_reference_lists_every_setting_with_its_default_and_range():
+    rows = _technical_rows()
+    assert SETTINGS - set(rows) == set(), "settings missing from docs/TECHNICAL.md"
+    for var in sorted(SETTINGS):
+        field = Settings.model_fields[var.removeprefix("DATAGVAT_").lower()]
+        default_cell = rows[var].split(" | ")[0]
+        if var in REQUIRED:
+            assert default_cell.strip() == "required", var
+        elif field.default in ("", None):
+            assert default_cell.startswith("unset"), f"{var}: {default_cell}"
+        else:
+            shown = re.match(r"`([^`]*)`", default_cell)
+            expected = str(field.default).lower() if isinstance(field.default, bool) else str(field.default)
+            assert shown and _same(shown.group(1), expected), f"{var}: {default_cell} != {expected}"
+        for meta in field.metadata:  # every bound the code enforces is written down
+            for attr in ("ge", "gt", "le", "lt"):
+                if (limit := getattr(meta, attr, None)) is not None:
+                    assert _bound(limit) in rows[var], f"{var}: bound {limit} missing from {rows[var]}"
+
+
+def test_the_minimum_pause_is_documented_where_it_is_allowed_to_be():
+    from datagvat_mcp.config import MIN_REQUEST_INTERVAL
+
+    rows = _technical_rows()
+    for var in HIDDEN_FROM_README:
+        assert f"{_bound(MIN_REQUEST_INTERVAL)}–" in rows[var], var
+    readme = read("README.md")
+    assert f"never below {_bound(MIN_REQUEST_INTERVAL)} s" in readme  # the floor itself is not a secret
 
 
 @pytest.mark.parametrize("name", [".env.example", "docker-compose.yml"])
@@ -79,8 +122,7 @@ def test_compose_and_env_example_state_the_real_defaults():
 def test_readme_states_the_real_defaults():
     readme = read("README.md")
     defaults = Settings()
-    row = re.search(r"\| `DATAGVAT_REQUEST_INTERVAL` \| `([\d.]+)` \|", readme)
-    assert row and float(row.group(1)) == defaults.request_interval
+    assert f"the server waits {_bound(defaults.request_interval)} s before sending the next request" in readme
     row = re.search(r"\| `DATAGVAT_QUEUE_TIMEOUT` \| `([\d.]+)` \|", readme)
     assert row and float(row.group(1)) == defaults.queue_timeout
     row = re.search(r"\| `DATAGVAT_PREVIEW_MAX_BYTES` \| `(\d+)` \|", readme)

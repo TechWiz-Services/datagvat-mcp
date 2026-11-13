@@ -7,7 +7,7 @@ import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import CreateMessageResult, ErrorData, TextContent
 
-from conftest import DATASET, DATASET_2, DATASET_3
+from conftest import DATASET, DATASET_2, DATASET_3, instant_throttle
 from datagvat_mcp.server import build_server
 
 EXPECTED_TOOLS = {
@@ -498,10 +498,10 @@ async def test_cache_file_keeps_answers_across_a_restart(tmp_path, fake_api):
     from datagvat_mcp.client import DataGvAtClient
 
     settings = make_settings(cache_dir=str(tmp_path))
-    first = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api))
+    first = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api), throttle=instant_throttle())
     await first.get_dataset(DATASET["id"])
     await first.close()
-    second = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api))
+    second = DataGvAtClient(settings, transport=httpx.MockTransport(fake_api), throttle=instant_throttle())
     assert (await second.get_dataset(DATASET["id"]))["id"] == DATASET["id"]
     assert len(fake_api.requests) == 1 and (tmp_path / "cache.sqlite3").exists()
     await second.close()
